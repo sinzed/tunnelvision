@@ -70,24 +70,62 @@ async function getActiveTabState(): Promise<BgActiveTabStateResponse> {
   return (await chrome.runtime.sendMessage({ type: 'BALE_BG_GET_ACTIVE_TAB_STATE' })) as BgActiveTabStateResponse;
 }
 
-function waitForIceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 12_000) {
-  if (pc.iceGatheringState === 'complete') return Promise.resolve();
-  return new Promise<void>((resolve, reject) => {
-    const to = setTimeout(() => {
-      cleanup();
-      reject(new Error('ICE gathering timed out'));
-    }, timeoutMs);
-    const onStateChange = () => {
+function countCandidatesInSdp(sdp?: string | null) {
+  if (!sdp) return 0;
+  return (sdp.match(/^a=candidate:/gm) ?? []).length;
+}
+
+async function waitForIceGathering(pc: RTCPeerConnection, opts?: { timeoutMs?: number; minCandidates?: number }) {
+  const timeoutMs = opts?.timeoutMs ?? 30_000;
+  const minCandidates = opts?.minCandidates ?? 1;
+
+  const already = countCandidatesInSdp(pc.localDescription?.sdp);
+  if (pc.iceGatheringState === 'complete' || already >= minCandidates) return;
+
+  return new Promise<void>(resolve => {
+    let bestCount = already;
+    const startedAt = Date.now();
+
+    const maybeDone = () => {
+      const nowCount = countCandidatesInSdp(pc.localDescription?.sdp);
+      if (nowCount > bestCount) {
+        bestCount = nowCount;
+        log(`[ice] candidates so far: ${bestCount}`);
+      }
+
+      const elapsed = Date.now() - startedAt;
       if (pc.iceGatheringState === 'complete') {
         cleanup();
+        log('[ice] gathering complete');
+        resolve();
+        return;
+      }
+      if (bestCount >= minCandidates) {
+        cleanup();
+        log(`[ice] got ${bestCount} candidate(s) (continuing without waiting for complete)`);
+        resolve();
+        return;
+      }
+      if (elapsed >= timeoutMs) {
+        cleanup();
+        log(`[ice] timed out after ${Math.round(timeoutMs / 1000)}s with ${bestCount} candidate(s)`);
         resolve();
       }
     };
+
+    const onIceCandidate = () => maybeDone();
+    const onGatheringChange = () => maybeDone();
+
+    const to = setTimeout(() => maybeDone(), timeoutMs);
     const cleanup = () => {
       clearTimeout(to);
-      pc.removeEventListener('icegatheringstatechange', onStateChange);
+      pc.removeEventListener('icecandidate', onIceCandidate);
+      pc.removeEventListener('icegatheringstatechange', onGatheringChange);
     };
-    pc.addEventListener('icegatheringstatechange', onStateChange);
+
+    pc.addEventListener('icecandidate', onIceCandidate);
+    pc.addEventListener('icegatheringstatechange', onGatheringChange);
+    maybeDone();
   });
 }
 
@@ -149,18 +187,21 @@ async function createOffer() {
   pcA = new RTCPeerConnection({ iceServers });
   pcA.addEventListener('connectionstatechange', () => log(`[pcA] ${pcA?.connectionState}`));
   pcA.addEventListener('iceconnectionstatechange', () => log(`[pcA] ice=${pcA?.iceConnectionState}`));
+  pcA.addEventListener('icecandidateerror', e => {
+    log(`[pcA] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
+  });
 
   dcA = pcA.createDataChannel('bale-link');
   attachDc(dcA, 'A');
 
   const offer = await pcA.createOffer();
   await pcA.setLocalDescription(offer);
-  await waitForIceGatheringComplete(pcA);
+  await waitForIceGathering(pcA);
 
   const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
   ($('#offerOut') as HTMLTextAreaElement).value = encodeBundle(bundle);
 
-  log('[offer] created (copy to Peer B)');
+  log(`[offer] created (candidates in SDP: ${countCandidatesInSdp(pcA.localDescription?.sdp)})`);
 }
 
 async function createAnswer() {
@@ -172,6 +213,9 @@ async function createAnswer() {
   const pc = new RTCPeerConnection({ iceServers });
   pc.addEventListener('connectionstatechange', () => log(`[pcB] ${pc.connectionState}`));
   pc.addEventListener('iceconnectionstatechange', () => log(`[pcB] ice=${pc.iceConnectionState}`));
+  pc.addEventListener('icecandidateerror', e => {
+    log(`[pcB] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
+  });
 
   pc.ondatachannel = e => {
     dcB = e.channel;
@@ -181,12 +225,12 @@ async function createAnswer() {
   await pc.setRemoteDescription(offerBundle.sdp);
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
-  await waitForIceGatheringComplete(pc);
+  await waitForIceGathering(pc);
 
   const answerBundle: HandshakeBundle = { sdp: pc.localDescription! };
   ($('#answerOut') as HTMLTextAreaElement).value = encodeBundle(answerBundle);
 
-  log('[answer] created (copy back to Peer A)');
+  log(`[answer] created (candidates in SDP: ${countCandidatesInSdp(pc.localDescription?.sdp)})`);
 }
 
 async function applyAnswer() {

@@ -19,8 +19,10 @@ const manifest = {
   },
   content_scripts: [
     {
-      matches: ['https://web.bale.ai/chat?uid=1508360342*'],
+      matches: ['https://web.bale.ai/*'],
       js: ['content/bale.js'],
+      run_at: 'document_start',
+      all_frames: true,
     },
   ],
   web_accessible_resources: [

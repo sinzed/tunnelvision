@@ -30,7 +30,13 @@ function injectHookScript() {
 
 function isIceServerUseful(s: IceServer) {
   const urls = (Array.isArray(s.urls) ? s.urls : [s.urls]).filter(Boolean) as string[];
-  return urls.some(u => u.startsWith('turn:') || u.startsWith('turns:') || u.startsWith('stun:'));
+  return urls.some(
+    u =>
+      u.startsWith('turn:') ||
+      u.startsWith('turns:') ||
+      u.startsWith('stun:') ||
+      u.startsWith('stuns:'),
+  );
 }
 
 function dedupeIceServers(servers: IceServer[]) {
