@@ -1,0 +1,24 @@
+{
+  "name": "bale-webrtc-peer-link",
+  "version": "0.5.0",
+  "description": "Chrome extension: capture Bale TURN creds + connect peers via WebRTC",
+  "type": "module",
+  "private": true,
+  "sideEffects": false,
+  "scripts": {
+    "clean:node_modules": "npx rimraf node_modules",
+    "clean:dist": "npx rimraf dist",
+    "clean": "npm run clean:dist && npm run clean:node_modules",
+    "ready": "tsc -p pre-build.tsconfig.json",
+    "build": "npm run ready && vite build",
+    "dev": "npm run build -- --mode development",
+    "type-check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.280",
+    "@types/node": "^22.13.10",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.2"
+  }
+}
