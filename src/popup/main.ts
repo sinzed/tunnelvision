@@ -280,6 +280,9 @@ let dcA: RTCDataChannel | null = null;
 let pcB: RTCPeerConnection | null = null;
 let dcB: RTCDataChannel | null = null;
 
+/** Resolves when the current “Create offer” click handler finishes (success or catch). */
+let offerCreationInFlight: Promise<void> | null = null;
+
 function setDcState(text: string) {
   ($('#dcState') as HTMLDivElement).textContent = text;
 }
@@ -307,19 +310,9 @@ function setChatOnlyLayout(on: boolean) {
   if (tr && on) tr.replaceChildren();
 }
 
-function closeLocalPeers() {
-  try {
-    dcA?.close();
-  } catch {
-    /* ignore */
-  }
+function closePeerBOnly() {
   try {
     dcB?.close();
-  } catch {
-    /* ignore */
-  }
-  try {
-    pcA?.close();
   } catch {
     /* ignore */
   }
@@ -328,10 +321,24 @@ function closeLocalPeers() {
   } catch {
     /* ignore */
   }
-  dcA = null;
   dcB = null;
-  pcA = null;
   pcB = null;
+}
+
+function closeLocalPeers() {
+  try {
+    dcA?.close();
+  } catch {
+    /* ignore */
+  }
+  closePeerBOnly();
+  try {
+    pcA?.close();
+  } catch {
+    /* ignore */
+  }
+  dcA = null;
+  pcA = null;
   setDcState('Not connected');
   setSendEnabled(false);
   setChatOnlyLayout(false);
@@ -379,13 +386,17 @@ async function getIceServersOrThrow(state: Extract<BgStateResponse, { ok: true }
 }
 
 function offererStillNeedsAnswer(pc: RTCPeerConnection | null): boolean {
-  if (!pc) return false;
-  return pc.localDescription?.type === 'offer' && !pc.remoteDescription;
+  if (!pc || pc.remoteDescription) return false;
+  // have-local-offer is set once setLocalDescription(offer) completes; prefer it over localDescription alone.
+  if (pc.signalingState === 'have-local-offer') return true;
+  return pc.localDescription?.type === 'offer';
 }
 
 /** Peer A loses in-memory pcA when the popup closes; rebuild from the saved offer blob before setRemoteDescription(answer). */
 async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
-  // Prefer description state over signalingState (some builds report differently while ICE runs).
+  if (offerCreationInFlight) {
+    await offerCreationInFlight;
+  }
   if (offererStillNeedsAnswer(pcA)) return;
 
   if (pcA?.remoteDescription) {
@@ -409,10 +420,13 @@ async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
   }
 
   const iceServers = await getIceServersOrThrow(st.state);
-  const offerBundle = decodeBundle(offerText);
+  const prevBundle = decodeBundle(offerText);
+  if (prevBundle.sdp.type && prevBundle.sdp.type !== 'offer') {
+    throw new Error('Saved blob is not an offer. Copy a fresh offer from “Create offer”.');
+  }
 
   closeLocalPeers();
-  await persistLogLine('[offer] restored local peer from saved offer (needed after popup closed or session cleared)');
+  await persistLogLine('[offer] rebuilt local peer (in-memory connection was gone — e.g. popup closed or “Create answer” cleared it)');
 
   pcA = new RTCPeerConnection({ iceServers });
   const log = (line: string) => {
@@ -428,7 +442,22 @@ async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
   dcA = pcA.createDataChannel('bale-link');
   attachDc(dcA, 'A');
 
-  await pcA.setLocalDescription(offerBundle.sdp);
+  // Chrome requires setLocalDescription to use the SDP from createOffer() on this same RTCPeerConnection;
+  // re-applying a serialized offer from an old PC throws “SDP does not match the previously generated SDP”.
+  const fresh = await pcA.createOffer();
+  await pcA.setLocalDescription(fresh);
+  await waitForIceGathering(pcA, log);
+
+  const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
+  const offerB64 = b64encodeUtf8(JSON.stringify(bundle));
+  ($('#offerOut') as HTMLTextAreaElement).value = offerB64;
+  await mergePeerLinkUi(tabId, { offerOut: offerB64 });
+  await persistLogLine(
+    '[offer] a new offer was generated (fingerprints/ICE differ from the saved blob). Share it with your peer, get a new answer, then click “Apply answer” again.',
+  );
+  throw new Error(
+    'Local peer was recreated, so the old answer no longer matches. Copy the updated offer to your peer, paste the new answer, and click “Apply answer” again.',
+  );
 }
 
 function applyUiFromState(r: Extract<BgStateResponse, { ok: true }>, opts?: { fullLog?: boolean }) {
@@ -575,7 +604,7 @@ async function main() {
   });
 
   ($('#btnOffer') as HTMLButtonElement).addEventListener('click', async () => {
-    try {
+    const run = async () => {
       const st = await getState();
       if (!st.ok) throw new Error(st.reason);
       const iceServers = await getIceServersOrThrow(st.state);
@@ -606,11 +635,18 @@ async function main() {
       ($('#offerOut') as HTMLTextAreaElement).value = offerB64;
       await mergePeerLinkUi(tabId, { offerOut: offerB64 });
       await persistLogLine(`[offer] done (candidates in SDP: ${countCandidatesInSdp(pcA.localDescription?.sdp)})`);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      await persistLogLine(`[error] ${msg}`);
-      closeLocalPeers();
-    }
+    };
+
+    offerCreationInFlight = run()
+      .catch(async e => {
+        const msg = e instanceof Error ? e.message : String(e);
+        await persistLogLine(`[error] ${msg}`);
+        closeLocalPeers();
+      })
+      .finally(() => {
+        offerCreationInFlight = null;
+      });
+    await offerCreationInFlight;
   });
 
   ($('#btnAnswer') as HTMLButtonElement).addEventListener('click', async () => {
@@ -621,7 +657,7 @@ async function main() {
       const offerText = ($('#offerIn') as HTMLTextAreaElement).value;
       if (!offerText.trim()) throw new Error('Paste an offer first.');
 
-      closeLocalPeers();
+      closePeerBOnly();
       await persistLogLine('[answer] creating…');
 
       const offerBundle = decodeBundle(offerText);
