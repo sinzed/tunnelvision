@@ -58,14 +58,23 @@ function dedupeIceServers(servers: IceServer[]) {
 }
 
 let latestIceServers: IceServer[] = [];
+let latestRawIceServers: IceServer[] = [];
 
-function setLatestIceServers(iceServers: IceServer[]) {
-  const filtered = dedupeIceServers(iceServers.filter(isIceServerUseful));
-  if (filtered.length === 0) return;
+function setLatestIceServers(rawFromPage: IceServer[]) {
+  latestRawIceServers = rawFromPage;
+  const filtered = dedupeIceServers(rawFromPage.filter(isIceServerUseful));
   latestIceServers = filtered;
-  chrome.runtime.sendMessage({ type: 'BALE_ICE_SERVERS', iceServers: latestIceServers, url: location.href }).catch(() => {
-    // ignore if background not ready
-  });
+  if (rawFromPage.length === 0) return;
+  chrome.runtime
+    .sendMessage({
+      type: 'BALE_ICE_SERVERS',
+      iceServers: filtered,
+      iceServersRaw: rawFromPage,
+      url: location.href,
+    })
+    .catch(() => {
+      // ignore if background not ready
+    });
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
@@ -85,7 +94,11 @@ window.addEventListener('message', (event: MessageEvent) => {
 // Also allow popup to ask the content script (tab) for the current capture.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'BALE_GET_ICE_SERVERS') {
-    sendResponse({ iceServers: latestIceServers, url: location.href });
+    sendResponse({
+      iceServers: latestIceServers,
+      iceServersRaw: latestRawIceServers,
+      url: location.href,
+    });
     return true;
   }
   return false;
