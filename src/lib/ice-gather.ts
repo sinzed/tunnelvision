@@ -17,7 +17,7 @@ export async function waitForIceGathering(
   log: (line: string) => void,
   opts?: { timeoutMs?: number; minCandidates?: number; waitUntilComplete?: boolean },
 ) {
-  const timeoutMs = opts?.timeoutMs ?? 30_000;
+  const timeoutMs = opts?.timeoutMs ?? 45_000;
   const minCandidates = opts?.minCandidates ?? 1;
   const waitUntilComplete = opts?.waitUntilComplete ?? false;
 
@@ -41,7 +41,13 @@ export async function waitForIceGathering(
         cleanup();
         const sdp = pc.localDescription?.sdp;
         const relay = countRelayCandidatesInSdp(sdp);
-        log(`[ice] gathering complete (${bestCount} candidate(s), relay=${relay})`);
+        const srflx = (sdp?.match(/^a=candidate:.*\btyp srflx\b/gm) ?? []).length;
+        log(`[ice] gathering complete (${bestCount} candidate(s), srflx=${srflx}, relay=${relay})`);
+        if (relay === 0) {
+          log(
+            '[ice] no relay (TURN) candidates — fine on LAN; across NAT, both sides need srflx (STUN) or relay (TURN). If this fails, capture a tab that uses TURN (e.g. during a call).',
+          );
+        }
         resolve();
         return;
       }

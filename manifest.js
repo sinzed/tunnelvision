@@ -6,7 +6,7 @@ const manifest = {
     version: packageJson.version,
     description: 'Captures WebRTC ICE (STUN/TURN) from Bale, Google Meet, and Telegram Web; peer link via WebRTC DataChannel.',
     host_permissions: ['https://web.bale.ai/*', 'https://meet.google.com/*', 'https://web.telegram.org/*'],
-    permissions: ['storage', 'tabs'],
+    permissions: ['storage', 'tabs', 'offscreen'],
     background: {
         service_worker: 'background.js',
         type: 'module',

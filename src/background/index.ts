@@ -14,6 +14,111 @@ const iceKey = (tabId: number) => `peerLink_ice_${tabId}`;
 const tabState = new Map<number, TabCaptureState>();
 const portsByTab = new Map<number, Set<chrome.runtime.Port>>();
 
+const OFFSCREEN_DOC_PATH = 'src/offscreen/peer-link-host.html';
+
+let offscreenPort: chrome.runtime.Port | null = null;
+let offscreenPortWaiters: Array<() => void> = [];
+
+const pendingOffscreenRpc = new Map<string, (msg: Record<string, unknown>) => void>();
+
+function resolveOffscreenPortWaiters() {
+  const w = offscreenPortWaiters;
+  offscreenPortWaiters = [];
+  for (const fn of w) fn();
+}
+
+chrome.runtime.onConnect.addListener(port => {
+  if (port.name !== 'peer-link-offscreen') return;
+  offscreenPort = port;
+  resolveOffscreenPortWaiters();
+  port.onMessage.addListener((msg: { _replyId?: string } & Record<string, unknown>) => {
+    const rid = msg._replyId;
+    if (typeof rid === 'string' && pendingOffscreenRpc.has(rid)) {
+      pendingOffscreenRpc.get(rid)!(msg);
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    offscreenPort = null;
+    for (const res of pendingOffscreenRpc.values()) {
+      res({ ok: false, error: 'Offscreen host disconnected.' });
+    }
+    pendingOffscreenRpc.clear();
+  });
+});
+
+function waitForOffscreenPort(timeoutMs: number): Promise<void> {
+  if (offscreenPort) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let done: () => void;
+    const t = setTimeout(() => {
+      const i = offscreenPortWaiters.indexOf(done);
+      if (i >= 0) offscreenPortWaiters.splice(i, 1);
+      reject(new Error('Timed out waiting for offscreen WebRTC host.'));
+    }, timeoutMs);
+    done = () => {
+      clearTimeout(t);
+      const i = offscreenPortWaiters.indexOf(done);
+      if (i >= 0) offscreenPortWaiters.splice(i, 1);
+      resolve();
+    };
+    offscreenPortWaiters.push(done);
+  });
+}
+
+async function ensureOffscreenDocument(): Promise<void> {
+  const url = chrome.runtime.getURL(OFFSCREEN_DOC_PATH);
+  let hasDoc = false;
+  try {
+    const existing = await chrome.runtime.getContexts({
+      contextTypes: [chrome.runtime.ContextType.OFFSCREEN_DOCUMENT],
+      documentUrls: [url],
+    });
+    hasDoc = existing.length > 0;
+  } catch {
+    hasDoc = false;
+  }
+  if (!hasDoc) {
+    try {
+      await chrome.offscreen.createDocument({
+        url: OFFSCREEN_DOC_PATH,
+        reasons: [chrome.offscreen.Reason.WEB_RTC],
+        justification:
+          'Keeps the WebRTC offerer PeerConnection alive while the extension popup is closed so answers still match.',
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!/Only a single offscreen|already exists|duplicate/i.test(msg)) throw e;
+    }
+  }
+  await waitForOffscreenPort(8000);
+}
+
+async function sendOffscreenRpc(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  await ensureOffscreenDocument();
+  if (!offscreenPort) throw new Error('Offscreen host not connected.');
+  const id = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      pendingOffscreenRpc.delete(id);
+      reject(new Error('Offscreen request timed out.'));
+    }, 120_000);
+    pendingOffscreenRpc.set(id, msg => {
+      clearTimeout(t);
+      pendingOffscreenRpc.delete(id);
+      resolve(msg);
+    });
+    offscreenPort!.postMessage({ ...payload, _replyId: id });
+  });
+}
+
+function postOffscreenCloseTab(tabId: number) {
+  try {
+    offscreenPort?.postMessage({ type: 'PL_HOST_CLOSE', tabId });
+  } catch {
+    /* ignore */
+  }
+}
+
 function setTabState(tabId: number, patch: TabCaptureState) {
   const prev = tabState.get(tabId) ?? {};
   const next = { ...prev, ...patch };
@@ -86,6 +191,7 @@ async function mergeStateForTab(tabId: number): Promise<TabCaptureState> {
 
 chrome.tabs.onRemoved.addListener(tabId => {
   tabState.delete(tabId);
+  postOffscreenCloseTab(tabId);
   void chrome.storage.local.remove([iceKey(tabId), peerLinkUiKey(tabId)]);
 });
 
@@ -151,6 +257,106 @@ chrome.runtime.onMessage.addListener((msg: any, sender: chrome.runtime.MessageSe
     const tabId = msg.tabId as number;
     if (typeof tabId === 'number') broadcastUi(tabId, msg.patch ?? {});
     return;
+  }
+
+  if (msg?.type === 'PL_HOST_LOG') {
+    const tabId = msg.tabId as number;
+    if (typeof tabId === 'number') appendLog(tabId, String(msg.line ?? ''));
+    return;
+  }
+
+  if (msg?.type === 'PL_HOST_DC_MSG') {
+    const tabId = msg.tabId as number;
+    if (typeof tabId === 'number') {
+      appendLog(tabId, `[peer] ${String(msg.text ?? '')}`);
+      for (const p of portsByTab.get(tabId) ?? []) {
+        try {
+          p.postMessage({ type: 'dcMsg', text: msg.text });
+        } catch {
+          // ignore
+        }
+      }
+    }
+    return;
+  }
+
+  if (msg?.type === 'PL_HOST_DC_STATE') {
+    const tabId = msg.tabId as number;
+    if (typeof tabId === 'number') {
+      for (const p of portsByTab.get(tabId) ?? []) {
+        try {
+          p.postMessage({
+            type: 'dcState',
+            state: msg.state,
+            label: msg.label,
+          });
+        } catch {
+          // ignore
+        }
+      }
+    }
+    return;
+  }
+
+  if (msg?.type === 'PL_OFFERER_CREATE') {
+    const tabId = msg.tabId as number;
+    if (typeof tabId !== 'number') return;
+    void (async () => {
+      try {
+        const r = await sendOffscreenRpc({
+          type: 'PL_HOST_CREATE_OFFER',
+          tabId,
+          iceServers: msg.iceServers,
+        });
+        sendResponse(r);
+      } catch (e: unknown) {
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg?.type === 'PL_OFFERER_APPLY_ANSWER') {
+    const tabId = msg.tabId as number;
+    if (typeof tabId !== 'number') return;
+    void (async () => {
+      try {
+        const r = await sendOffscreenRpc({
+          type: 'PL_HOST_APPLY_ANSWER',
+          tabId,
+          answerText: String(msg.answerText ?? ''),
+        });
+        sendResponse(r);
+      } catch (e: unknown) {
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg?.type === 'PL_OFFERER_DC_SEND') {
+    const tabId = msg.tabId as number;
+    if (typeof tabId !== 'number') return;
+    void (async () => {
+      try {
+        const r = await sendOffscreenRpc({
+          type: 'PL_HOST_DC_SEND',
+          tabId,
+          text: String(msg.text ?? ''),
+        });
+        sendResponse(r);
+      } catch (e: unknown) {
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (msg?.type === 'PL_OFFERER_CLOSE') {
+    const tabId = msg.tabId as number;
+    if (typeof tabId === 'number') postOffscreenCloseTab(tabId);
+    sendResponse({ ok: true });
+    return true;
   }
 
   if (msg?.type === 'BALE_BG_GET_ACTIVE_TAB_STATE') {

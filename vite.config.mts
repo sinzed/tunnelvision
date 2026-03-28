@@ -26,6 +26,7 @@ export default defineConfig({
         'content/bale': resolve(srcDir, 'content', 'bale.ts'),
         'injected/bale-webrtc-hook': resolve(srcDir, 'injected', 'bale-webrtc-hook.ts'),
         popup: resolve(srcDir, 'popup', 'index.html'),
+        'offscreen/peer-link-host': resolve(srcDir, 'offscreen', 'peer-link-host.html'),
       },
       external: ['chrome'],
       output: {

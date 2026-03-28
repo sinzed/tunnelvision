@@ -3,6 +3,8 @@ import {
   countRelayCandidatesInSdp,
   waitForIceGathering,
 } from '../lib/ice-gather';
+import { decodeBundle, encodeBundle, type HandshakeBundle } from '../lib/handshake-bundle';
+import { mergeIceServersWithPublicStun } from '../lib/merge-ice-servers';
 import { mergePeerLinkUi } from '../lib/peer-link-ui-storage';
 
 type BgStateResponse =
@@ -27,11 +29,11 @@ type BgStateResponse =
     }
   | { ok: false; reason: string };
 
-type HandshakeBundle = { sdp: RTCSessionDescriptionInit };
-
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T | null;
 
 let activeTabId: number | null = null;
+/** Offerer DataChannel lives in the offscreen host; this mirrors its open state for Send/UI. */
+let offererDcOpen = false;
 
 function setUiMode(mode: 'offer' | 'receive', persistTabId?: number) {
   const pOffer = $('#panelOffer') as HTMLElement | null;
@@ -138,7 +140,7 @@ function render() {
     <button type="button" class="pl-seg__btn pl-seg__btn--active" id="modeOffer" role="tab" aria-selected="true" aria-pressed="true">Start — I send offer</button>
     <button type="button" class="pl-seg__btn" id="modeRecv" role="tab" aria-selected="false" aria-pressed="false">Join — I send answer</button>
   </div>
-  <p class="pl-hint">Keep this window open while the link is active. Handshake text is saved per tab when you close the popup. Each blob waits until ICE gathering finishes so STUN/TURN candidates are inside the SDP — offer and answer are enough; no separate ICE trickle step.</p>
+  <p class="pl-hint">The offer side runs WebRTC in a hidden background page so you can close the popup after copying the offer and reopen it to paste the answer without regenerating the offer. Handshake text is saved per tab. Each blob waits until ICE gathering finishes so STUN/TURN candidates are inside the SDP — offer and answer are enough; no separate ICE trickle step.</p>
 
   <div id="panelOffer" class="pl-panel-offer">
     <div class="pl-row-actions">
@@ -267,20 +269,6 @@ function debounce<T extends (...args: any[]) => void>(fn: T, ms: number) {
   };
 }
 
-function b64encodeUtf8(text: string) {
-  return btoa(unescape(encodeURIComponent(text)));
-}
-function b64decodeUtf8(b64: string) {
-  return decodeURIComponent(escape(atob(b64)));
-}
-
-function decodeBundle(text: string): HandshakeBundle {
-  const raw = b64decodeUtf8(text.trim());
-  return JSON.parse(raw) as HandshakeBundle;
-}
-
-let pcA: RTCPeerConnection | null = null;
-let dcA: RTCDataChannel | null = null;
 let pcB: RTCPeerConnection | null = null;
 let dcB: RTCDataChannel | null = null;
 
@@ -330,19 +318,11 @@ function closePeerBOnly() {
 }
 
 function closeLocalPeers() {
-  try {
-    dcA?.close();
-  } catch {
-    /* ignore */
+  if (typeof activeTabId === 'number') {
+    void chrome.runtime.sendMessage({ type: 'PL_OFFERER_CLOSE', tabId: activeTabId });
   }
+  offererDcOpen = false;
   closePeerBOnly();
-  try {
-    pcA?.close();
-  } catch {
-    /* ignore */
-  }
-  dcA = null;
-  pcA = null;
   setDcState('Not connected');
   setSendEnabled(false);
   setChatOnlyLayout(false);
@@ -380,84 +360,14 @@ function iceServersForPc(state: Extract<BgStateResponse, { ok: true }>['state'])
 }
 
 async function getIceServersOrThrow(state: Extract<BgStateResponse, { ok: true }>['state']): Promise<RTCIceServer[]> {
-  const servers = iceServersForPc(state);
+  const captured = iceServersForPc(state);
+  const servers = mergeIceServersWithPublicStun(captured);
   if (!servers.length) {
     throw new Error(
-      'No ICE servers for this tab. Open the chat/call page, wait for WebRTC, then click “Refresh from tab”.',
+      'No ICE servers available. Open the chat/call page, wait for WebRTC, then click “Refresh from tab”.',
     );
   }
   return servers;
-}
-
-function offererStillNeedsAnswer(pc: RTCPeerConnection | null): boolean {
-  if (!pc || pc.remoteDescription) return false;
-  // have-local-offer is set once setLocalDescription(offer) completes; prefer it over localDescription alone.
-  if (pc.signalingState === 'have-local-offer') return true;
-  return pc.localDescription?.type === 'offer';
-}
-
-/** Peer A loses in-memory pcA when the popup closes; rebuild with the saved offer SDP (not a new offer) so the pasted answer still matches. */
-async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
-  if (offerCreationInFlight) {
-    await offerCreationInFlight;
-  }
-  if (offererStillNeedsAnswer(pcA)) return;
-
-  if (pcA?.remoteDescription) {
-    throw new Error('Answer was already applied. Use “Clear session” if you need a new offer.');
-  }
-
-  let offerText = ($('#offerOut') as HTMLTextAreaElement).value.trim();
-  const st = await getState();
-  if (!st.ok) throw new Error(st.reason);
-
-  if (!offerText && typeof st.ui?.offerOut === 'string' && st.ui.offerOut.trim()) {
-    offerText = st.ui.offerOut.trim();
-    ($('#offerOut') as HTMLTextAreaElement).value = offerText;
-    await persistLogLine('[offer] loaded offer blob from storage (field was empty)');
-  }
-
-  if (!offerText) {
-    throw new Error(
-      'No saved offer. Click “Create offer” first, or reload the popup so the offer field refills from storage.',
-    );
-  }
-
-  const iceServers = await getIceServersOrThrow(st.state);
-  const prevBundle = decodeBundle(offerText);
-  if (prevBundle.sdp.type && prevBundle.sdp.type !== 'offer') {
-    throw new Error('Saved blob is not an offer. Copy a fresh offer from “Create offer”.');
-  }
-  if (!prevBundle.sdp.sdp?.trim()) {
-    throw new Error('Saved offer has no SDP. Click “Create offer” again.');
-  }
-
-  closeLocalPeers();
-  await persistLogLine('[offer] rebuilt local peer (in-memory connection was gone — e.g. popup closed or “Create answer” cleared it)');
-
-  pcA = new RTCPeerConnection({ iceServers });
-  const log = (line: string) => {
-    appendLogLine(line);
-    void chrome.runtime.sendMessage({ type: 'BALE_APPEND_LOG', tabId, line }).catch(() => void 0);
-  };
-  pcA.addEventListener('connectionstatechange', () => log(`[pcA] ${pcA?.connectionState}`));
-  pcA.addEventListener('iceconnectionstatechange', () => log(`[pcA] ice=${pcA?.iceConnectionState}`));
-  pcA.addEventListener('icecandidateerror', e => {
-    log(`[pcA] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
-  });
-
-  dcA = pcA.createDataChannel('bale-link');
-  attachDc(dcA, 'A');
-
-  // Rehydrate the exact offer your peer answered (same ICE/DTLS as the blob). Do not call createOffer()
-  // first — that generates a new SDP and would invalidate the pasted answer.
-  const restored: RTCSessionDescriptionInit = {
-    type: 'offer',
-    sdp: prevBundle.sdp.sdp,
-  };
-  await pcA.setLocalDescription(restored);
-  await waitForIceGathering(pcA, log, { waitUntilComplete: true });
-  await persistLogLine('[offer] restored local peer from saved offer blob (pairs with existing answer)');
 }
 
 function applyUiFromState(r: Extract<BgStateResponse, { ok: true }>, opts?: { fullLog?: boolean }) {
@@ -521,9 +431,41 @@ async function main() {
   const port = chrome.runtime.connect({ name: 'peer-link' });
   port.postMessage({ type: 'subscribe', tabId });
 
-  port.onMessage.addListener((msg: { type?: string; line?: string; patch?: Record<string, string>; ui?: any }) => {
+  port.onMessage.addListener(
+    (msg: {
+      type?: string;
+      line?: string;
+      patch?: Record<string, string>;
+      ui?: any;
+      text?: string;
+      state?: string;
+      label?: string;
+    }) => {
     if (msg?.type === 'log' && typeof msg.line === 'string') {
       appendLogLine(msg.line);
+    }
+    if (msg?.type === 'dcMsg' && typeof msg.text === 'string') {
+      appendChatLine('peer', msg.text);
+    }
+    if (msg?.type === 'dcState') {
+      const st = msg.state;
+      const label = typeof msg.label === 'string' ? msg.label : 'A';
+      if (st === 'open') {
+        offererDcOpen = true;
+        setDcState(`Connected (${label})`);
+        setSendEnabled(true);
+        setChatOnlyLayout(true);
+      } else {
+        offererDcOpen = false;
+        if (dcB?.readyState === 'open') {
+          setDcState('Connected (B)');
+          setSendEnabled(true);
+        } else {
+          setDcState('Not connected');
+          setSendEnabled(false);
+          setChatOnlyLayout(false);
+        }
+      }
     }
     if (msg?.type === 'ui' && msg.patch) {
       const p = msg.patch;
@@ -547,7 +489,8 @@ async function main() {
         setLogText(u.logs.join('\n'));
       }
     }
-  });
+  },
+  );
 
   const r = await getState();
   const status = $('#status')!;
@@ -610,34 +553,19 @@ async function main() {
       const iceServers = await getIceServersOrThrow(st.state);
 
       closeLocalPeers();
-      await persistLogLine('[offer] creating…');
 
-      pcA = new RTCPeerConnection({ iceServers });
-      const log = (line: string) => {
-        appendLogLine(line);
-        void chrome.runtime.sendMessage({ type: 'BALE_APPEND_LOG', tabId, line }).catch(() => void 0);
-      };
-      pcA.addEventListener('connectionstatechange', () => log(`[pcA] ${pcA?.connectionState}`));
-      pcA.addEventListener('iceconnectionstatechange', () => log(`[pcA] ice=${pcA?.iceConnectionState}`));
-      pcA.addEventListener('icecandidateerror', e => {
-        log(`[pcA] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
-      });
+      const resp = (await chrome.runtime.sendMessage({
+        type: 'PL_OFFERER_CREATE',
+        tabId,
+        iceServers,
+      })) as { ok?: boolean; offerB64?: string; error?: string };
 
-      dcA = pcA.createDataChannel('bale-link');
-      attachDc(dcA, 'A');
+      if (!resp?.ok || !resp.offerB64) {
+        throw new Error(resp?.error ?? 'Create offer failed');
+      }
 
-      const offer = await pcA.createOffer();
-      await pcA.setLocalDescription(offer);
-      await waitForIceGathering(pcA, log, { waitUntilComplete: true });
-
-      const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
-      const offerB64 = b64encodeUtf8(JSON.stringify(bundle));
-      ($('#offerOut') as HTMLTextAreaElement).value = offerB64;
-      await mergePeerLinkUi(tabId, { offerOut: offerB64 });
-      const sdpA = pcA.localDescription?.sdp;
-      await persistLogLine(
-        `[offer] done (candidates: ${countCandidatesInSdp(sdpA)}, relay: ${countRelayCandidatesInSdp(sdpA)})`,
-      );
+      ($('#offerOut') as HTMLTextAreaElement).value = resp.offerB64;
+      await mergePeerLinkUi(tabId, { offerOut: resp.offerB64 });
     };
 
     offerCreationInFlight = run()
@@ -687,7 +615,7 @@ async function main() {
 
       pcB = pc;
       const bundle: HandshakeBundle = { sdp: pc.localDescription! };
-      const answerB64 = b64encodeUtf8(JSON.stringify(bundle));
+      const answerB64 = encodeBundle(bundle);
       ($('#answerOut') as HTMLTextAreaElement).value = answerB64;
       await mergePeerLinkUi(tabId, { offerIn: offerText, answerOut: answerB64 });
       const sdpB = pc.localDescription?.sdp;
@@ -697,7 +625,7 @@ async function main() {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       await persistLogLine(`[error] ${msg}`);
-      closeLocalPeers();
+      closePeerBOnly();
     }
   });
 
@@ -705,11 +633,18 @@ async function main() {
     try {
       const answerText = ($('#answerIn') as HTMLTextAreaElement).value;
       if (!answerText.trim()) throw new Error('Paste an answer first.');
-      await ensureOffererReadyForAnswer(tabId);
-      const answerBundle = decodeBundle(answerText);
-      await pcA!.setRemoteDescription(answerBundle.sdp);
+      if (offerCreationInFlight) {
+        await offerCreationInFlight;
+      }
+      const resp = (await chrome.runtime.sendMessage({
+        type: 'PL_OFFERER_APPLY_ANSWER',
+        tabId,
+        answerText,
+      })) as { ok?: boolean; error?: string };
+      if (!resp?.ok) {
+        throw new Error(resp?.error ?? 'Apply answer failed');
+      }
       await mergePeerLinkUi(tabId, { answerIn: answerText });
-      await persistLogLine('[answer] applied');
     } catch (e) {
       await persistLogLine(`[error] ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -717,12 +652,27 @@ async function main() {
 
   ($('#btnSend') as HTMLButtonElement).addEventListener('click', async () => {
     const text = ($('#msgIn') as HTMLTextAreaElement).value;
-    const dc = dcA?.readyState === 'open' ? dcA : dcB?.readyState === 'open' ? dcB : null;
-    if (!dc) {
-      await persistLogLine('[send] DataChannel not open');
-      return;
-    }
+    if (!text.trim()) return;
     try {
+      if (offererDcOpen) {
+        const resp = (await chrome.runtime.sendMessage({
+          type: 'PL_OFFERER_DC_SEND',
+          tabId,
+          text,
+        })) as { ok?: boolean; error?: string };
+        if (!resp?.ok) {
+          throw new Error(resp?.error ?? 'Send failed');
+        }
+        appendChatLine('me', text);
+        await persistLogLine(`[me] ${text}`);
+        ($('#msgIn') as HTMLTextAreaElement).value = '';
+        return;
+      }
+      const dc = dcB?.readyState === 'open' ? dcB : null;
+      if (!dc) {
+        await persistLogLine('[send] DataChannel not open');
+        return;
+      }
       dc.send(text);
       appendChatLine('me', text);
       await persistLogLine(`[me] ${text}`);
