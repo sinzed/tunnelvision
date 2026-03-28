@@ -1,4 +1,8 @@
-import { countCandidatesInSdp, waitForIceGathering } from '../lib/ice-gather';
+import {
+  countCandidatesInSdp,
+  countRelayCandidatesInSdp,
+  waitForIceGathering,
+} from '../lib/ice-gather';
 import { mergePeerLinkUi } from '../lib/peer-link-ui-storage';
 
 type BgStateResponse =
@@ -134,7 +138,7 @@ function render() {
     <button type="button" class="pl-seg__btn pl-seg__btn--active" id="modeOffer" role="tab" aria-selected="true" aria-pressed="true">Start — I send offer</button>
     <button type="button" class="pl-seg__btn" id="modeRecv" role="tab" aria-selected="false" aria-pressed="false">Join — I send answer</button>
   </div>
-  <p class="pl-hint">Keep this window open while the link is active. Handshake text is saved per tab when you close the popup.</p>
+  <p class="pl-hint">Keep this window open while the link is active. Handshake text is saved per tab when you close the popup. Each blob waits until ICE gathering finishes so STUN/TURN candidates are inside the SDP — offer and answer are enough; no separate ICE trickle step.</p>
 
   <div id="panelOffer" class="pl-panel-offer">
     <div class="pl-row-actions">
@@ -446,7 +450,7 @@ async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
   // re-applying a serialized offer from an old PC throws “SDP does not match the previously generated SDP”.
   const fresh = await pcA.createOffer();
   await pcA.setLocalDescription(fresh);
-  await waitForIceGathering(pcA, log);
+  await waitForIceGathering(pcA, log, { waitUntilComplete: true });
 
   const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
   const offerB64 = b64encodeUtf8(JSON.stringify(bundle));
@@ -628,13 +632,16 @@ async function main() {
 
       const offer = await pcA.createOffer();
       await pcA.setLocalDescription(offer);
-      await waitForIceGathering(pcA, log);
+      await waitForIceGathering(pcA, log, { waitUntilComplete: true });
 
       const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
       const offerB64 = b64encodeUtf8(JSON.stringify(bundle));
       ($('#offerOut') as HTMLTextAreaElement).value = offerB64;
       await mergePeerLinkUi(tabId, { offerOut: offerB64 });
-      await persistLogLine(`[offer] done (candidates in SDP: ${countCandidatesInSdp(pcA.localDescription?.sdp)})`);
+      const sdpA = pcA.localDescription?.sdp;
+      await persistLogLine(
+        `[offer] done (candidates: ${countCandidatesInSdp(sdpA)}, relay: ${countRelayCandidatesInSdp(sdpA)})`,
+      );
     };
 
     offerCreationInFlight = run()
@@ -680,14 +687,17 @@ async function main() {
       await pc.setRemoteDescription(offerBundle.sdp);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      await waitForIceGathering(pc, log);
+      await waitForIceGathering(pc, log, { waitUntilComplete: true });
 
       pcB = pc;
       const bundle: HandshakeBundle = { sdp: pc.localDescription! };
       const answerB64 = b64encodeUtf8(JSON.stringify(bundle));
       ($('#answerOut') as HTMLTextAreaElement).value = answerB64;
       await mergePeerLinkUi(tabId, { offerIn: offerText, answerOut: answerB64 });
-      await persistLogLine(`[answer] done (candidates in SDP: ${countCandidatesInSdp(pc.localDescription?.sdp)})`);
+      const sdpB = pc.localDescription?.sdp;
+      await persistLogLine(
+        `[answer] done (candidates: ${countCandidatesInSdp(sdpB)}, relay: ${countRelayCandidatesInSdp(sdpB)})`,
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       await persistLogLine(`[error] ${msg}`);
