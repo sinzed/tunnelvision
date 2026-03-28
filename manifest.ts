@@ -7,8 +7,8 @@ const manifest = {
   name: 'Bale WebRTC Peer Link',
   version: packageJson.version,
   description:
-    'Captures Bale WebRTC TURN credentials and helps connect two extension users via a WebRTC DataChannel.',
-  host_permissions: ['https://web.bale.ai/*'],
+    'Captures WebRTC ICE (STUN/TURN) from Bale, Google Meet, and Telegram Web; peer link via WebRTC DataChannel.',
+  host_permissions: ['https://web.bale.ai/*', 'https://meet.google.com/*', 'https://web.telegram.org/*'],
   permissions: ['storage', 'tabs'],
   background: {
     service_worker: 'background.js',
@@ -19,7 +19,7 @@ const manifest = {
   },
   content_scripts: [
     {
-      matches: ['https://web.bale.ai/*'],
+      matches: ['https://web.bale.ai/*', 'https://meet.google.com/*', 'https://web.telegram.org/*'],
       js: ['content/bale.js'],
       run_at: 'document_start',
       all_frames: true,
@@ -28,7 +28,7 @@ const manifest = {
   web_accessible_resources: [
     {
       resources: ['injected/bale-webrtc-hook.js'],
-      matches: ['https://web.bale.ai/*'],
+      matches: ['https://web.bale.ai/*', 'https://meet.google.com/*', 'https://web.telegram.org/*'],
     },
   ],
 };

@@ -1,21 +1,19 @@
-type IceServer = RTCIceServer;
-
-type BgActiveTabStateResponse =
-  | { ok: true; tabId: number; state: { url?: string; iceServers?: IceServer[]; updatedAt?: number; lastError?: string } }
+type BgStateResponse =
+  | {
+      ok: true;
+      tabId: number;
+      state: { url?: string; iceServers?: RTCIceServer[]; updatedAt?: number; lastError?: string };
+      ui: { offerOut?: string; offerIn?: string; answerOut?: string; answerIn?: string; logs?: string[] };
+      peer: {
+        role: string;
+        connectionState: string;
+        iceConnectionState: string;
+        dcState: string | null;
+      } | null;
+    }
   | { ok: false; reason: string };
 
-type HandshakeBundle = {
-  sdp: RTCSessionDescriptionInit;
-};
-
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T | null;
-
-function b64encodeUtf8(text: string) {
-  return btoa(unescape(encodeURIComponent(text)));
-}
-function b64decodeUtf8(b64: string) {
-  return decodeURIComponent(escape(atob(b64)));
-}
 
 function render() {
   document.body.style.margin = '0';
@@ -25,11 +23,12 @@ function render() {
   const root = $('#app')!;
   root.innerHTML = `
     <div style="padding:12px 12px 10px;border-bottom:1px solid #e9e9ee;">
-      <div style="font-weight:650;font-size:14px;">Bale Peer Link</div>
+      <div style="font-weight:650;font-size:14px;">Peer Link</div>
       <div id="status" style="margin-top:6px;font-size:12px;color:#555;line-height:1.35;"></div>
     </div>
 
     <div style="padding:12px;display:grid;gap:10px;">
+      <div style="font-size:11px;color:#666;">WebRTC runs in the background while this popup is closed. ICE servers are saved per tab.</div>
       <div style="display:grid;gap:6px;">
         <div style="font-size:12px;font-weight:600;">1) Create offer (Peer A)</div>
         <button id="btnOffer" style="padding:8px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;">Create offer</button>
@@ -49,6 +48,10 @@ function render() {
         <button id="btnApplyAnswer" style="padding:8px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;">Apply answer</button>
       </div>
 
+      <div style="display:flex;gap:8px;">
+        <button id="btnReset" style="flex:1;padding:8px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;">Reset peer session</button>
+      </div>
+
       <div style="display:grid;gap:6px;">
         <div style="font-size:12px;font-weight:600;">DataChannel</div>
         <div id="dcState" style="font-size:12px;color:#555;">Not connected</div>
@@ -60,247 +63,160 @@ function render() {
   `;
 }
 
-function log(line: string) {
+function setLogText(text: string) {
+  const el = $('#log') as HTMLPreElement;
+  el.textContent = text;
+  el.scrollTop = el.scrollHeight;
+}
+
+function appendLogLine(line: string) {
   const el = $('#log') as HTMLPreElement;
   el.textContent = (el.textContent ? el.textContent + '\n' : '') + line;
   el.scrollTop = el.scrollHeight;
 }
 
-async function getActiveTabState(): Promise<BgActiveTabStateResponse> {
-  return (await chrome.runtime.sendMessage({ type: 'BALE_BG_GET_ACTIVE_TAB_STATE' })) as BgActiveTabStateResponse;
+async function getState(): Promise<BgStateResponse> {
+  return (await chrome.runtime.sendMessage({ type: 'BALE_BG_GET_ACTIVE_TAB_STATE' })) as BgStateResponse;
 }
 
-function countCandidatesInSdp(sdp?: string | null) {
-  if (!sdp) return 0;
-  return (sdp.match(/^a=candidate:/gm) ?? []).length;
-}
-
-async function waitForIceGathering(pc: RTCPeerConnection, opts?: { timeoutMs?: number; minCandidates?: number }) {
-  const timeoutMs = opts?.timeoutMs ?? 30_000;
-  const minCandidates = opts?.minCandidates ?? 1;
-
-  const already = countCandidatesInSdp(pc.localDescription?.sdp);
-  if (pc.iceGatheringState === 'complete' || already >= minCandidates) return;
-
-  return new Promise<void>(resolve => {
-    let bestCount = already;
-    const startedAt = Date.now();
-
-    const maybeDone = () => {
-      const nowCount = countCandidatesInSdp(pc.localDescription?.sdp);
-      if (nowCount > bestCount) {
-        bestCount = nowCount;
-        log(`[ice] candidates so far: ${bestCount}`);
-      }
-
-      const elapsed = Date.now() - startedAt;
-      if (pc.iceGatheringState === 'complete') {
-        cleanup();
-        log('[ice] gathering complete');
-        resolve();
-        return;
-      }
-      if (bestCount >= minCandidates) {
-        cleanup();
-        log(`[ice] got ${bestCount} candidate(s) (continuing without waiting for complete)`);
-        resolve();
-        return;
-      }
-      if (elapsed >= timeoutMs) {
-        cleanup();
-        log(`[ice] timed out after ${Math.round(timeoutMs / 1000)}s with ${bestCount} candidate(s)`);
-        resolve();
-      }
-    };
-
-    const onIceCandidate = () => maybeDone();
-    const onGatheringChange = () => maybeDone();
-
-    const to = setTimeout(() => maybeDone(), timeoutMs);
-    const cleanup = () => {
-      clearTimeout(to);
-      pc.removeEventListener('icecandidate', onIceCandidate);
-      pc.removeEventListener('icegatheringstatechange', onGatheringChange);
-    };
-
-    pc.addEventListener('icecandidate', onIceCandidate);
-    pc.addEventListener('icegatheringstatechange', onGatheringChange);
-    maybeDone();
-  });
-}
-
-let pcA: RTCPeerConnection | null = null;
-let dcA: RTCDataChannel | null = null;
-let dcB: RTCDataChannel | null = null;
-
-function setDcState(text: string) {
-  const el = $('#dcState')!;
-  el.textContent = text;
-}
-
-function setSendEnabled(enabled: boolean) {
-  const btn = $('#btnSend') as HTMLButtonElement;
-  btn.disabled = !enabled;
-}
-
-function attachDc(dc: RTCDataChannel, label: string) {
-  dc.addEventListener('open', () => {
-    setDcState(`Connected (${label})`);
-    setSendEnabled(true);
-    log(`[dc] open (${label})`);
-  });
-  dc.addEventListener('close', () => {
-    setDcState('Closed');
-    setSendEnabled(false);
-    log(`[dc] close (${label})`);
-  });
-  dc.addEventListener('message', e => {
-    log(`[peer] ${String(e.data)}`);
-  });
-  dc.addEventListener('error', () => {
-    log(`[dc] error (${label})`);
-  });
-}
-
-async function getIceServersOrThrow(): Promise<IceServer[]> {
-  const r = await getActiveTabState();
-  if (!r.ok) throw new Error(r.reason);
-  const servers = r.state.iceServers ?? [];
-  if (!servers.length) {
-    throw new Error('No TURN/STUN servers captured yet. Open Bale chat and wait until it starts a call/WebRTC.');
-  }
-  return servers;
-}
-
-function decodeBundle(text: string): HandshakeBundle {
-  const raw = b64decodeUtf8(text.trim());
-  return JSON.parse(raw) as HandshakeBundle;
-}
-function encodeBundle(bundle: HandshakeBundle) {
-  return b64encodeUtf8(JSON.stringify(bundle));
-}
-
-async function createOffer() {
-  const iceServers = await getIceServersOrThrow();
-
-  pcA?.close();
-  pcA = new RTCPeerConnection({ iceServers });
-  pcA.addEventListener('connectionstatechange', () => log(`[pcA] ${pcA?.connectionState}`));
-  pcA.addEventListener('iceconnectionstatechange', () => log(`[pcA] ice=${pcA?.iceConnectionState}`));
-  pcA.addEventListener('icecandidateerror', e => {
-    log(`[pcA] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
-  });
-
-  dcA = pcA.createDataChannel('bale-link');
-  attachDc(dcA, 'A');
-
-  const offer = await pcA.createOffer();
-  await pcA.setLocalDescription(offer);
-  await waitForIceGathering(pcA);
-
-  const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
-  ($('#offerOut') as HTMLTextAreaElement).value = encodeBundle(bundle);
-
-  log(`[offer] created (candidates in SDP: ${countCandidatesInSdp(pcA.localDescription?.sdp)})`);
-}
-
-async function createAnswer() {
-  const iceServers = await getIceServersOrThrow();
-  const offerText = ($('#offerIn') as HTMLTextAreaElement).value;
-  if (!offerText.trim()) throw new Error('Paste an offer first.');
-
-  const offerBundle = decodeBundle(offerText);
-  const pc = new RTCPeerConnection({ iceServers });
-  pc.addEventListener('connectionstatechange', () => log(`[pcB] ${pc.connectionState}`));
-  pc.addEventListener('iceconnectionstatechange', () => log(`[pcB] ice=${pc.iceConnectionState}`));
-  pc.addEventListener('icecandidateerror', e => {
-    log(`[pcB] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
-  });
-
-  pc.ondatachannel = e => {
-    dcB = e.channel;
-    attachDc(dcB, 'B');
+function debounce<T extends (...args: any[]) => void>(fn: T, ms: number) {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  return (...args: Parameters<T>) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
   };
-
-  await pc.setRemoteDescription(offerBundle.sdp);
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  await waitForIceGathering(pc);
-
-  const answerBundle: HandshakeBundle = { sdp: pc.localDescription! };
-  ($('#answerOut') as HTMLTextAreaElement).value = encodeBundle(answerBundle);
-
-  log(`[answer] created (candidates in SDP: ${countCandidatesInSdp(pc.localDescription?.sdp)})`);
 }
 
-async function applyAnswer() {
-  if (!pcA) throw new Error('Create an offer first.');
-  const answerText = ($('#answerIn') as HTMLTextAreaElement).value;
-  if (!answerText.trim()) throw new Error('Paste an answer first.');
+function applyUiFromState(
+  r: Extract<BgStateResponse, { ok: true }>,
+  opts?: { fullLog?: boolean },
+) {
+  const ui = r.ui ?? {};
+  if (ui.offerOut != null) ($('#offerOut') as HTMLTextAreaElement).value = ui.offerOut;
+  if (ui.offerIn != null) ($('#offerIn') as HTMLTextAreaElement).value = ui.offerIn;
+  if (ui.answerOut != null) ($('#answerOut') as HTMLTextAreaElement).value = ui.answerOut;
+  if (ui.answerIn != null) ($('#answerIn') as HTMLTextAreaElement).value = ui.answerIn;
 
-  const answerBundle = decodeBundle(answerText);
-  await pcA.setRemoteDescription(answerBundle.sdp);
-  log('[answer] applied');
+  if (opts?.fullLog && ui.logs?.length) {
+    setLogText(ui.logs.join('\n'));
+  }
+
+  const peer = r.peer;
+  const dcEl = $('#dcState')!;
+  if (!peer) {
+    dcEl.textContent = 'No active peer session (create offer or answer)';
+  } else {
+    dcEl.textContent = `role=${peer.role} pc=${peer.connectionState} ice=${peer.iceConnectionState} dc=${peer.dcState ?? '—'}`;
+  }
+
+  const sendOk = peer?.dcState === 'open';
+  ($('#btnSend') as HTMLButtonElement).disabled = !sendOk;
+}
+
+function wireUiPersistence(tabId: number) {
+  const save = debounce((patch: Record<string, string>) => {
+    void chrome.runtime.sendMessage({ type: 'BALE_UI_SAVE', tabId, patch });
+  }, 400);
+
+  for (const id of ['offerOut', 'offerIn', 'answerOut', 'answerIn'] as const) {
+    const el = $(`#${id}`) as HTMLTextAreaElement;
+    el.addEventListener('input', () => save({ [id]: el.value }));
+  }
 }
 
 async function main() {
   render();
-  setDcState('Not connected');
 
-  const status = $('#status')!;
-  try {
-    const r = await getActiveTabState();
-    if (!r.ok) {
-      status.textContent = `Active tab: unavailable (${r.reason})`;
-    } else {
-      const age = r.state.updatedAt ? `${Math.round((Date.now() - r.state.updatedAt) / 1000)}s ago` : 'never';
-      const count = r.state.iceServers?.length ?? 0;
-      status.textContent = `Active tab: ${r.state.url ?? '(unknown)'}\nCaptured iceServers: ${count} (updated: ${age})${
-        r.state.lastError ? `\nLast hook error: ${r.state.lastError}` : ''
-      }`;
-    }
-  } catch (e) {
-    status.textContent = `Status error: ${e instanceof Error ? e.message : String(e)}`;
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tabId = tabs[0]?.id;
+  if (typeof tabId !== 'number') {
+    ($('#status')!).textContent = 'No active tab';
+    return;
   }
 
-  ($('#btnOffer') as HTMLButtonElement).addEventListener('click', async () => {
-    try {
-      await createOffer();
-    } catch (e) {
-      log(`[error] ${e instanceof Error ? e.message : String(e)}`);
+  const port = chrome.runtime.connect({ name: 'peer-link' });
+  port.postMessage({ type: 'subscribe', tabId });
+
+  port.onMessage.addListener((msg: { type?: string; line?: string; patch?: Record<string, string>; ui?: any }) => {
+    if (msg?.type === 'log' && typeof msg.line === 'string') {
+      appendLogLine(msg.line);
     }
+    if (msg?.type === 'ui' && msg.patch) {
+      const p = msg.patch;
+      if (typeof p.offerOut === 'string') ($('#offerOut') as HTMLTextAreaElement).value = p.offerOut;
+      if (typeof p.offerIn === 'string') ($('#offerIn') as HTMLTextAreaElement).value = p.offerIn;
+      if (typeof p.answerOut === 'string') ($('#answerOut') as HTMLTextAreaElement).value = p.answerOut;
+      if (typeof p.answerIn === 'string') ($('#answerIn') as HTMLTextAreaElement).value = p.answerIn;
+    }
+    if (msg?.type === 'init' && msg.ui) {
+      const u = msg.ui;
+      if (typeof u.offerOut === 'string') ($('#offerOut') as HTMLTextAreaElement).value = u.offerOut;
+      if (typeof u.offerIn === 'string') ($('#offerIn') as HTMLTextAreaElement).value = u.offerIn;
+      if (typeof u.answerOut === 'string') ($('#answerOut') as HTMLTextAreaElement).value = u.answerOut;
+      if (typeof u.answerIn === 'string') ($('#answerIn') as HTMLTextAreaElement).value = u.answerIn;
+      if (u.logs?.length) setLogText(u.logs.join('\n'));
+    }
+  });
+
+  const r = await getState();
+  const status = $('#status')!;
+  if (!r.ok) {
+    status.textContent = `Active tab: unavailable (${r.reason})`;
+    return;
+  }
+
+  const age = r.state.updatedAt ? `${Math.round((Date.now() - r.state.updatedAt) / 1000)}s ago` : 'never';
+  const count = r.state.iceServers?.length ?? 0;
+  status.textContent = `Active tab: ${r.state.url ?? '(unknown)'}\nCaptured iceServers: ${count} (updated: ${age})${
+    r.state.lastError ? `\nLast hook error: ${r.state.lastError}` : ''
+  }`;
+
+  applyUiFromState(r, { fullLog: true });
+  wireUiPersistence(tabId);
+
+  ($('#btnOffer') as HTMLButtonElement).addEventListener('click', async () => {
+    const res = (await chrome.runtime.sendMessage({ type: 'BALE_PC_CREATE_OFFER' })) as { ok: boolean; error?: string; offerOut?: string };
+    if (!res.ok) appendLogLine(`[error] ${res.error ?? 'unknown'}`);
+    else if (res.offerOut) ($('#offerOut') as HTMLTextAreaElement).value = res.offerOut;
+    const st = await getState();
+    if (st.ok) applyUiFromState(st);
   });
 
   ($('#btnAnswer') as HTMLButtonElement).addEventListener('click', async () => {
-    try {
-      await createAnswer();
-    } catch (e) {
-      log(`[error] ${e instanceof Error ? e.message : String(e)}`);
-    }
+    const offerIn = ($('#offerIn') as HTMLTextAreaElement).value;
+    const res = (await chrome.runtime.sendMessage({ type: 'BALE_PC_CREATE_ANSWER', offerIn })) as {
+      ok: boolean;
+      error?: string;
+      answerOut?: string;
+    };
+    if (!res.ok) appendLogLine(`[error] ${res.error ?? 'unknown'}`);
+    else if (res.answerOut) ($('#answerOut') as HTMLTextAreaElement).value = res.answerOut;
+    const st = await getState();
+    if (st.ok) applyUiFromState(st);
   });
 
   ($('#btnApplyAnswer') as HTMLButtonElement).addEventListener('click', async () => {
-    try {
-      await applyAnswer();
-    } catch (e) {
-      log(`[error] ${e instanceof Error ? e.message : String(e)}`);
-    }
+    const answerIn = ($('#answerIn') as HTMLTextAreaElement).value;
+    const res = (await chrome.runtime.sendMessage({ type: 'BALE_PC_APPLY_ANSWER', answerIn })) as { ok: boolean; error?: string };
+    if (!res.ok) appendLogLine(`[error] ${res.error ?? 'unknown'}`);
+    const st = await getState();
+    if (st.ok) applyUiFromState(st);
   });
 
-  ($('#btnSend') as HTMLButtonElement).addEventListener('click', () => {
-    const msg = ($('#msgIn') as HTMLTextAreaElement).value;
-    const dc = dcA?.readyState === 'open' ? dcA : dcB?.readyState === 'open' ? dcB : null;
-    if (!dc) {
-      log('[send] DataChannel not open');
-      return;
-    }
-    dc.send(msg);
-    log(`[me] ${msg}`);
+  ($('#btnSend') as HTMLButtonElement).addEventListener('click', async () => {
+    const text = ($('#msgIn') as HTMLTextAreaElement).value;
+    const res = (await chrome.runtime.sendMessage({ type: 'BALE_PC_SEND', text })) as { ok: boolean; error?: string };
+    if (!res.ok) appendLogLine(`[error] ${res.error ?? 'unknown'}`);
+  });
+
+  ($('#btnReset') as HTMLButtonElement).addEventListener('click', async () => {
+    await chrome.runtime.sendMessage({ type: 'BALE_PC_RESET' });
+    const st = await getState();
+    if (st.ok) applyUiFromState(st);
   });
 }
 
 main().catch(e => {
   render();
-  log(`[fatal] ${e instanceof Error ? e.message : String(e)}`);
+  setLogText(`[fatal] ${e instanceof Error ? e.message : String(e)}`);
 });
-
