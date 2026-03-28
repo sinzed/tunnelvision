@@ -134,7 +134,7 @@ function render() {
     <button type="button" class="pl-seg__btn pl-seg__btn--active" id="modeOffer" role="tab" aria-selected="true" aria-pressed="true">Start — I send offer</button>
     <button type="button" class="pl-seg__btn" id="modeRecv" role="tab" aria-selected="false" aria-pressed="false">Join — I send answer</button>
   </div>
-  <p class="pl-hint">Keep this window open while the link is active. Handshake text is saved per tab when you close the popup.</p>
+  <p class="pl-hint">The offer-side WebRTC connection keeps running in the background if you close this popup to copy blobs. Handshake text is still saved per tab.</p>
 
   <div id="panelOffer" class="pl-panel-offer">
     <div class="pl-row-actions">
@@ -275,8 +275,26 @@ function decodeBundle(text: string): HandshakeBundle {
   return JSON.parse(raw) as HandshakeBundle;
 }
 
-let pcA: RTCPeerConnection | null = null;
-let dcA: RTCDataChannel | null = null;
+type OffererRpcResult = {
+  ok: boolean;
+  error?: string;
+  hasPc?: boolean;
+  waitingForAnswer?: boolean;
+  hasRemoteAnswer?: boolean;
+  dcOpen?: boolean;
+  offerOut?: string;
+  candidateCount?: number;
+};
+
+async function offererRpc(tabId: number, op: string, extra: Record<string, unknown> = {}): Promise<OffererRpcResult> {
+  return (await chrome.runtime.sendMessage({
+    type: 'BALE_OFFERER_RPC',
+    tabId,
+    op,
+    ...extra,
+  })) as OffererRpcResult;
+}
+
 let pcB: RTCPeerConnection | null = null;
 let dcB: RTCDataChannel | null = null;
 
@@ -326,19 +344,10 @@ function closePeerBOnly() {
 }
 
 function closeLocalPeers() {
-  try {
-    dcA?.close();
-  } catch {
-    /* ignore */
-  }
   closePeerBOnly();
-  try {
-    pcA?.close();
-  } catch {
-    /* ignore */
+  if (typeof activeTabId === 'number') {
+    void offererRpc(activeTabId, 'reset', {}).catch(() => void 0);
   }
-  dcA = null;
-  pcA = null;
   setDcState('Not connected');
   setSendEnabled(false);
   setChatOnlyLayout(false);
@@ -385,79 +394,30 @@ async function getIceServersOrThrow(state: Extract<BgStateResponse, { ok: true }
   return servers;
 }
 
-function offererStillNeedsAnswer(pc: RTCPeerConnection | null): boolean {
-  if (!pc || pc.remoteDescription) return false;
-  // have-local-offer is set once setLocalDescription(offer) completes; prefer it over localDescription alone.
-  if (pc.signalingState === 'have-local-offer') return true;
-  return pc.localDescription?.type === 'offer';
+/**
+ * Offer-side RTCPeerConnection lives in an offscreen document so it survives popup close
+ * (the popup unloads when you click away to copy blobs to the peer).
+ */
+async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
+  if (offerCreationInFlight) await offerCreationInFlight;
+  const r = await offererRpc(tabId, 'getState', {});
+  if (!r.ok) throw new Error(r.error ?? 'Could not read offer-side WebRTC state');
+  if (r.waitingForAnswer) return;
+  if (r.hasRemoteAnswer) {
+    throw new Error('Answer was already applied. Use “Clear local peers” if you need a new offer.');
+  }
+  throw new Error(
+    'No active offer connection. Click “Create offer” (again if needed), send the offer to your peer, then apply their answer.',
+  );
 }
 
-/** Peer A loses in-memory pcA when the popup closes; rebuild from the saved offer blob before setRemoteDescription(answer). */
-async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
-  if (offerCreationInFlight) {
-    await offerCreationInFlight;
+async function syncOffererUiFromHost(tabId: number) {
+  const r = await offererRpc(tabId, 'getState', {});
+  if (r.ok && r.dcOpen) {
+    setDcState('Connected (A)');
+    setSendEnabled(true);
+    setChatOnlyLayout(true);
   }
-  if (offererStillNeedsAnswer(pcA)) return;
-
-  if (pcA?.remoteDescription) {
-    throw new Error('Answer was already applied. Use “Clear session” if you need a new offer.');
-  }
-
-  let offerText = ($('#offerOut') as HTMLTextAreaElement).value.trim();
-  const st = await getState();
-  if (!st.ok) throw new Error(st.reason);
-
-  if (!offerText && typeof st.ui?.offerOut === 'string' && st.ui.offerOut.trim()) {
-    offerText = st.ui.offerOut.trim();
-    ($('#offerOut') as HTMLTextAreaElement).value = offerText;
-    await persistLogLine('[offer] loaded offer blob from storage (field was empty)');
-  }
-
-  if (!offerText) {
-    throw new Error(
-      'No saved offer. Click “Create offer” first, or reload the popup so the offer field refills from storage.',
-    );
-  }
-
-  const iceServers = await getIceServersOrThrow(st.state);
-  const prevBundle = decodeBundle(offerText);
-  if (prevBundle.sdp.type && prevBundle.sdp.type !== 'offer') {
-    throw new Error('Saved blob is not an offer. Copy a fresh offer from “Create offer”.');
-  }
-
-  closeLocalPeers();
-  await persistLogLine('[offer] rebuilt local peer (in-memory connection was gone — e.g. popup closed or “Create answer” cleared it)');
-
-  pcA = new RTCPeerConnection({ iceServers });
-  const log = (line: string) => {
-    appendLogLine(line);
-    void chrome.runtime.sendMessage({ type: 'BALE_APPEND_LOG', tabId, line }).catch(() => void 0);
-  };
-  pcA.addEventListener('connectionstatechange', () => log(`[pcA] ${pcA?.connectionState}`));
-  pcA.addEventListener('iceconnectionstatechange', () => log(`[pcA] ice=${pcA?.iceConnectionState}`));
-  pcA.addEventListener('icecandidateerror', e => {
-    log(`[pcA] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
-  });
-
-  dcA = pcA.createDataChannel('bale-link');
-  attachDc(dcA, 'A');
-
-  // Chrome requires setLocalDescription to use the SDP from createOffer() on this same RTCPeerConnection;
-  // re-applying a serialized offer from an old PC throws “SDP does not match the previously generated SDP”.
-  const fresh = await pcA.createOffer();
-  await pcA.setLocalDescription(fresh);
-  await waitForIceGathering(pcA, log);
-
-  const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
-  const offerB64 = b64encodeUtf8(JSON.stringify(bundle));
-  ($('#offerOut') as HTMLTextAreaElement).value = offerB64;
-  await mergePeerLinkUi(tabId, { offerOut: offerB64 });
-  await persistLogLine(
-    '[offer] a new offer was generated (fingerprints/ICE differ from the saved blob). Share it with your peer, get a new answer, then click “Apply answer” again.',
-  );
-  throw new Error(
-    'Local peer was recreated, so the old answer no longer matches. Copy the updated offer to your peer, paste the new answer, and click “Apply answer” again.',
-  );
 }
 
 function applyUiFromState(r: Extract<BgStateResponse, { ok: true }>, opts?: { fullLog?: boolean }) {
@@ -521,9 +481,23 @@ async function main() {
   const port = chrome.runtime.connect({ name: 'peer-link' });
   port.postMessage({ type: 'subscribe', tabId });
 
-  port.onMessage.addListener((msg: { type?: string; line?: string; patch?: Record<string, string>; ui?: any }) => {
+  port.onMessage.addListener((msg: { type?: string; line?: string; patch?: Record<string, string>; ui?: any; text?: string; open?: boolean }) => {
     if (msg?.type === 'log' && typeof msg.line === 'string') {
       appendLogLine(msg.line);
+    }
+    if (msg?.type === 'offerer_dc' && typeof msg.text === 'string') {
+      appendChatLine('peer', msg.text);
+    }
+    if (msg?.type === 'offerer_dc_state') {
+      if (msg.open) {
+        setDcState('Connected (A)');
+        setSendEnabled(true);
+        setChatOnlyLayout(true);
+      } else {
+        setDcState('Not connected');
+        setSendEnabled(false);
+        setChatOnlyLayout(false);
+      }
     }
     if (msg?.type === 'ui' && msg.patch) {
       const p = msg.patch;
@@ -566,6 +540,7 @@ async function main() {
   applyUiFromState(r, { fullLog: true });
   wireUiPersistence(tabId);
   bindHandshakeFlushOnClose(tabId);
+  void syncOffererUiFromHost(tabId);
 
   ($('#modeOffer') as HTMLButtonElement).addEventListener('click', () => setUiMode('offer', tabId));
   ($('#modeRecv') as HTMLButtonElement).addEventListener('click', () => setUiMode('receive', tabId));
@@ -612,29 +587,12 @@ async function main() {
       closeLocalPeers();
       await persistLogLine('[offer] creating…');
 
-      pcA = new RTCPeerConnection({ iceServers });
-      const log = (line: string) => {
-        appendLogLine(line);
-        void chrome.runtime.sendMessage({ type: 'BALE_APPEND_LOG', tabId, line }).catch(() => void 0);
-      };
-      pcA.addEventListener('connectionstatechange', () => log(`[pcA] ${pcA?.connectionState}`));
-      pcA.addEventListener('iceconnectionstatechange', () => log(`[pcA] ice=${pcA?.iceConnectionState}`));
-      pcA.addEventListener('icecandidateerror', e => {
-        log(`[pcA] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
-      });
+      const created = await offererRpc(tabId, 'createOffer', { iceServers });
+      if (!created.ok || !created.offerOut) throw new Error(created.error ?? 'Create offer failed');
 
-      dcA = pcA.createDataChannel('bale-link');
-      attachDc(dcA, 'A');
-
-      const offer = await pcA.createOffer();
-      await pcA.setLocalDescription(offer);
-      await waitForIceGathering(pcA, log);
-
-      const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
-      const offerB64 = b64encodeUtf8(JSON.stringify(bundle));
-      ($('#offerOut') as HTMLTextAreaElement).value = offerB64;
-      await mergePeerLinkUi(tabId, { offerOut: offerB64 });
-      await persistLogLine(`[offer] done (candidates in SDP: ${countCandidatesInSdp(pcA.localDescription?.sdp)})`);
+      ($('#offerOut') as HTMLTextAreaElement).value = created.offerOut;
+      await mergePeerLinkUi(tabId, { offerOut: created.offerOut });
+      await persistLogLine(`[offer] done (candidates in SDP: ${created.candidateCount ?? 0})`);
     };
 
     offerCreationInFlight = run()
@@ -691,7 +649,7 @@ async function main() {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       await persistLogLine(`[error] ${msg}`);
-      closeLocalPeers();
+      closePeerBOnly();
     }
   });
 
@@ -701,7 +659,8 @@ async function main() {
       if (!answerText.trim()) throw new Error('Paste an answer first.');
       await ensureOffererReadyForAnswer(tabId);
       const answerBundle = decodeBundle(answerText);
-      await pcA!.setRemoteDescription(answerBundle.sdp);
+      const applied = await offererRpc(tabId, 'applyAnswer', { answer: answerBundle.sdp });
+      if (!applied.ok) throw new Error(applied.error ?? 'Apply answer failed');
       await mergePeerLinkUi(tabId, { answerIn: answerText });
       await persistLogLine('[answer] applied');
     } catch (e) {
@@ -711,19 +670,31 @@ async function main() {
 
   ($('#btnSend') as HTMLButtonElement).addEventListener('click', async () => {
     const text = ($('#msgIn') as HTMLTextAreaElement).value;
-    const dc = dcA?.readyState === 'open' ? dcA : dcB?.readyState === 'open' ? dcB : null;
-    if (!dc) {
-      await persistLogLine('[send] DataChannel not open');
+    if (dcB?.readyState === 'open') {
+      try {
+        dcB.send(text);
+        appendChatLine('me', text);
+        await persistLogLine(`[me] ${text}`);
+        ($('#msgIn') as HTMLTextAreaElement).value = '';
+      } catch (e) {
+        await persistLogLine(`[error] ${e instanceof Error ? e.message : String(e)}`);
+      }
       return;
     }
-    try {
-      dc.send(text);
-      appendChatLine('me', text);
-      await persistLogLine(`[me] ${text}`);
-      ($('#msgIn') as HTMLTextAreaElement).value = '';
-    } catch (e) {
-      await persistLogLine(`[error] ${e instanceof Error ? e.message : String(e)}`);
+    const st = await offererRpc(tabId, 'getState', {});
+    if (st.ok && st.dcOpen) {
+      try {
+        const sent = await offererRpc(tabId, 'sendDc', { text });
+        if (!sent.ok) throw new Error(sent.error ?? 'send failed');
+        appendChatLine('me', text);
+        await persistLogLine(`[me] ${text}`);
+        ($('#msgIn') as HTMLTextAreaElement).value = '';
+      } catch (e) {
+        await persistLogLine(`[error] ${e instanceof Error ? e.message : String(e)}`);
+      }
+      return;
     }
+    await persistLogLine('[send] DataChannel not open');
   });
 
   ($('#btnReset') as HTMLButtonElement).addEventListener('click', async () => {

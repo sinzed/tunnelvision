@@ -11,8 +11,30 @@ type TabCaptureState = {
 
 const iceKey = (tabId: number) => `peerLink_ice_${tabId}`;
 
+const OFFSCREEN_PATH = 'src/offscreen/offscreen.html';
+
 const tabState = new Map<number, TabCaptureState>();
 const portsByTab = new Map<number, Set<chrome.runtime.Port>>();
+
+async function ensureOffscreenDoc(): Promise<void> {
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_PATH,
+      reasons: [chrome.offscreen.Reason.WEB_RTC],
+      justification:
+        'Keeps the WebRTC offer-side PeerConnection alive when the extension popup closes (e.g. while copying blobs to a peer).',
+    });
+  } catch (e: unknown) {
+    const s = e instanceof Error ? e.message : String(e);
+    if (s.includes('Only a single offscreen') || s.includes('already exists')) return;
+    throw e;
+  }
+}
+
+async function offererOffscreenRpc(msg: Record<string, unknown>): Promise<unknown> {
+  await ensureOffscreenDoc();
+  return chrome.runtime.sendMessage({ type: 'BALE_OFFSCREEN_OFFERER', ...msg });
+}
 
 function setTabState(tabId: number, patch: TabCaptureState) {
   const prev = tabState.get(tabId) ?? {};
@@ -85,6 +107,9 @@ async function mergeStateForTab(tabId: number): Promise<TabCaptureState> {
 }
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  void chrome.runtime
+    .sendMessage({ type: 'BALE_OFFSCREEN_OFFERER', tabId, op: 'reset' })
+    .catch(() => void 0);
   tabState.delete(tabId);
   void chrome.storage.local.remove([iceKey(tabId), peerLinkUiKey(tabId)]);
 });
@@ -167,6 +192,53 @@ chrome.runtime.onMessage.addListener((msg: any, sender: chrome.runtime.MessageSe
         sendResponse({ ok: true, tabId, state, ui });
       })
       .catch((err: unknown) => sendResponse({ ok: false, reason: err instanceof Error ? err.message : String(err) }));
+    return true;
+  }
+
+  if (msg?.type === 'BALE_OFFERER_EVENT') {
+    const tabId = msg.tabId as number;
+    if (typeof tabId !== 'number') return false;
+    if (msg.kind === 'log' && typeof msg.line === 'string') appendLog(tabId, msg.line);
+    if (msg.kind === 'dc_message' && typeof msg.text === 'string') {
+      appendLog(tabId, `[peer] ${msg.text}`);
+      for (const p of portsByTab.get(tabId) ?? []) {
+        try {
+          p.postMessage({ type: 'offerer_dc', text: msg.text });
+        } catch {
+          /* port closed */
+        }
+      }
+    }
+    if (msg.kind === 'dc_open') {
+      appendLog(tabId, '[dc] open (A)');
+      for (const p of portsByTab.get(tabId) ?? []) {
+        try {
+          p.postMessage({ type: 'offerer_dc_state', open: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    if (msg.kind === 'dc_close') {
+      appendLog(tabId, '[dc] close (A)');
+      for (const p of portsByTab.get(tabId) ?? []) {
+        try {
+          p.postMessage({ type: 'offerer_dc_state', open: false });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return false;
+  }
+
+  if (msg?.type === 'BALE_OFFERER_RPC') {
+    const { type: _t, ...rest } = msg as { type?: string } & Record<string, unknown>;
+    void offererOffscreenRpc(rest)
+      .then(r => sendResponse(r))
+      .catch((err: unknown) =>
+        sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) }),
+      );
     return true;
   }
 
