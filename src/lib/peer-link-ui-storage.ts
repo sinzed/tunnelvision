@@ -1,6 +1,8 @@
 /** UI + logs for Peer Link, keyed by browser tab (same keys as background). */
 
 export type PeerLinkStoredUi = {
+  /** Which handshake UX panel was last open. */
+  uiRole?: 'offer' | 'receive';
   offerOut?: string;
   offerIn?: string;
   answerOut?: string;

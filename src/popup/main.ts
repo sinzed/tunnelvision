@@ -12,7 +12,14 @@ type BgStateResponse =
         updatedAt?: number;
         lastError?: string;
       };
-      ui: { offerOut?: string; offerIn?: string; answerOut?: string; answerIn?: string; logs?: string[] };
+      ui: {
+        uiRole?: 'offer' | 'receive';
+        offerOut?: string;
+        offerIn?: string;
+        answerOut?: string;
+        answerIn?: string;
+        logs?: string[];
+      };
     }
   | { ok: false; reason: string };
 
@@ -22,62 +29,166 @@ const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as
 
 let activeTabId: number | null = null;
 
+function setUiMode(mode: 'offer' | 'receive', persistTabId?: number) {
+  const pOffer = $('#panelOffer') as HTMLElement | null;
+  const pRecv = $('#panelReceive') as HTMLElement | null;
+  const offerBtn = $('#modeOffer') as HTMLButtonElement | null;
+  const recvBtn = $('#modeRecv') as HTMLButtonElement | null;
+  if (!pOffer || !pRecv || !offerBtn || !recvBtn) return;
+  const isOffer = mode === 'offer';
+  pOffer.toggleAttribute('hidden', !isOffer);
+  pRecv.toggleAttribute('hidden', isOffer);
+  offerBtn.classList.toggle('pl-seg__btn--active', isOffer);
+  recvBtn.classList.toggle('pl-seg__btn--active', !isOffer);
+  offerBtn.setAttribute('aria-pressed', String(isOffer));
+  recvBtn.setAttribute('aria-pressed', String(!isOffer));
+  if (typeof persistTabId === 'number') void mergePeerLinkUi(persistTabId, { uiRole: mode });
+}
+
+async function copyToClipboard(text: string): Promise<boolean> {
+  const t = text.trim();
+  if (!t) return false;
+  try {
+    await navigator.clipboard.writeText(t);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function flashButtonLabel(btn: HTMLButtonElement, ok: boolean) {
+  const prev = btn.textContent ?? '';
+  btn.textContent = ok ? 'Copied!' : 'Failed';
+  setTimeout(() => {
+    btn.textContent = prev;
+  }, 1500);
+}
+
 function render() {
   document.body.style.margin = '0';
-  document.body.style.fontFamily = 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
-  document.body.style.width = '420px';
+  document.body.style.fontFamily = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  document.body.style.width = '400px';
+  document.body.style.background = '#eef0f4';
 
   const root = $('#app')!;
   root.innerHTML = `
-    <div style="padding:12px 12px 10px;border-bottom:1px solid #e9e9ee;">
-      <div style="font-weight:650;font-size:14px;">Peer Link</div>
-      <div id="status" style="margin-top:6px;font-size:12px;color:#555;line-height:1.35;"></div>
+<style>
+  .pl-card{background:var(--pl-card,#fff);border:1px solid var(--pl-border,#dfe3eb);border-radius:12px;padding:12px;margin:10px;box-shadow:0 1px 2px rgba(15,23,42,.04);}
+  .pl-head{border-bottom:1px solid var(--pl-border,#dfe3eb);padding:12px 14px;margin:-10px -10px 12px -10px;background:linear-gradient(180deg,#fafbfd 0%,#fff 100%);border-radius:12px 12px 0 0;}
+  .pl-title{font-weight:650;font-size:15px;color:#0f172a;letter-spacing:-0.02em;}
+  .pl-status{margin-top:6px;font-size:11px;color:#64748b;line-height:1.45;white-space:pre-wrap;}
+  .pl-seg{display:flex;padding:3px;background:#e8ecf2;border-radius:10px;gap:3px;margin-bottom:4px;}
+  .pl-seg__btn{flex:1;border:none;background:transparent;padding:8px 10px;font-size:12px;font-weight:600;color:#475569;border-radius:8px;cursor:pointer;transition:background .15s,color .15s;}
+  .pl-seg__btn:hover{color:#0f172a;}
+  .pl-seg__btn--active{background:#fff;color:#1d4ed8;box-shadow:0 1px 2px rgba(15,23,42,.08);}
+  .pl-hint{font-size:11px;color:#64748b;line-height:1.45;margin:0 0 10px;}
+  .pl-label{display:block;font-size:11px;font-weight:600;color:#334155;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;}
+  .pl-blob-row{display:flex;flex-direction:column;gap:8px;margin-bottom:12px;}
+  .pl-blob{width:100%;min-height:88px;max-height:120px;padding:10px 11px;border:1px solid var(--pl-border,#dfe3eb);border-radius:10px;font-size:11px;line-height:1.45;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box;}
+  .pl-blob--out{background:#f1f5f9;color:#0f172a;cursor:default;user-select:text;}
+  .pl-blob--in{background:#fff;color:#0f172a;}
+  textarea.pl-blob--out:read-only{opacity:1;}
+  .pl-btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 14px;border-radius:10px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid transparent;transition:filter .12s;}
+  .pl-btn:disabled{opacity:.45;cursor:not-allowed;}
+  .pl-btn--primary{background:#1d4ed8;color:#fff;}
+  .pl-btn--primary:hover:not(:disabled){filter:brightness(1.05);}
+  .pl-btn--secondary{background:#fff;color:#334155;border-color:#cbd5e1;}
+  .pl-btn--secondary:hover:not(:disabled){background:#f8fafc;}
+  .pl-btn--ghost{background:transparent;color:#475569;border-color:#cbd5e1;}
+  .pl-row-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px;}
+  .pl-ice summary{cursor:pointer;font-size:12px;font-weight:600;color:#475569;padding:4px 0;}
+  .pl-ice .pl-muted{font-size:11px;color:#64748b;margin:6px 0;}
+  .pl-footer-actions{display:flex;gap:8px;margin-top:4px;}
+  .pl-chat .pl-label{margin-top:4px;}
+  body.pl-chat-only{background:#eef0f4;}
+  body.pl-chat-only #pl-setup{display:none !important;}
+  body.pl-chat-only .pl-chat{margin:8px;box-shadow:0 2px 8px rgba(15,23,42,.06);}
+  body.pl-chat-only .pl-chat #msgIn{min-height:96px;max-height:220px;}
+  body.pl-chat-only #pl-log-section{display:none !important;}
+  .pl-transcript{display:none;max-height:200px;overflow-y:auto;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;margin-bottom:10px;font-size:12px;line-height:1.45;}
+  body.pl-chat-only .pl-transcript{display:block;}
+  .pl-tr--me{margin:6px 0;padding:6px 10px;background:#dbeafe;border-radius:10px 10px 4px 10px;text-align:left;color:#1e3a8a;word-break:break-word;}
+  .pl-tr--peer{margin:6px 0;padding:6px 10px;background:#fff;border:1px solid #e2e8f0;border-radius:10px 10px 10px 4px;color:#0f172a;word-break:break-word;}
+</style>
+
+<div id="pl-setup">
+<div class="pl-head">
+  <div class="pl-title">Peer Link</div>
+  <div id="status" class="pl-status"></div>
+</div>
+
+<div class="pl-card">
+  <div class="pl-seg" role="tablist" aria-label="Connection role">
+    <button type="button" class="pl-seg__btn pl-seg__btn--active" id="modeOffer" role="tab" aria-selected="true" aria-pressed="true">Start — I send offer</button>
+    <button type="button" class="pl-seg__btn" id="modeRecv" role="tab" aria-selected="false" aria-pressed="false">Join — I send answer</button>
+  </div>
+  <p class="pl-hint">Keep this window open while the link is active. Handshake text is saved per tab when you close the popup.</p>
+
+  <div id="panelOffer" class="pl-panel-offer">
+    <div class="pl-row-actions">
+      <button type="button" class="pl-btn pl-btn--primary" id="btnOffer">1. Create offer</button>
     </div>
-
-    <div style="padding:12px;display:grid;gap:10px;">
-      <div style="display:grid;gap:6px;">
-        <div style="font-size:12px;font-weight:600;">Captured ICE (STUN / TURN)</div>
-        <div style="font-size:11px;color:#666;">Full JSON from the page hook. Credentials are sensitive—do not share.</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button id="btnRefreshIce" type="button" style="padding:6px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;">Refresh from tab</button>
-        </div>
-        <pre id="iceSummary" style="margin:0;padding:8px;border:1px solid #eee;border-radius:8px;background:#f7f7fa;font-size:11px;max-height:100px;overflow:auto;white-space:pre-wrap;"></pre>
-        <pre id="iceJson" style="margin:0;padding:8px;border:1px solid #ddd;border-radius:8px;background:#fafafa;font-size:10px;line-height:1.35;max-height:180px;overflow:auto;"></pre>
-      </div>
-
-      <div style="font-size:11px;color:#666;">WebRTC runs in this popup while connected. Offer/answer blobs are saved to storage when the popup closes so you can paste Peer B’s answer after reopening.</div>
-
-      <div style="display:grid;gap:6px;">
-        <div style="font-size:12px;font-weight:600;">1) Create offer (Peer A)</div>
-        <button id="btnOffer" type="button" style="padding:8px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;">Create offer</button>
-        <textarea id="offerOut" placeholder="Offer appears here (copy and send to Peer B)" style="width:100%;height:90px;resize:vertical;padding:8px;border:1px solid #ddd;border-radius:8px;font-size:12px;"></textarea>
-      </div>
-
-      <div style="display:grid;gap:6px;">
-        <div style="font-size:12px;font-weight:600;">2) Create answer (Peer B)</div>
-        <textarea id="offerIn" placeholder="Paste offer from Peer A" style="width:100%;height:70px;resize:vertical;padding:8px;border:1px solid #ddd;border-radius:8px;font-size:12px;"></textarea>
-        <button id="btnAnswer" type="button" style="padding:8px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;">Create answer</button>
-        <textarea id="answerOut" placeholder="Answer appears here (copy back to Peer A)" style="width:100%;height:90px;resize:vertical;padding:8px;border:1px solid #ddd;border-radius:8px;font-size:12px;"></textarea>
-      </div>
-
-      <div style="display:grid;gap:6px;">
-        <div style="font-size:12px;font-weight:600;">3) Apply answer (Peer A)</div>
-        <textarea id="answerIn" placeholder="Paste answer from Peer B" style="width:100%;height:70px;resize:vertical;padding:8px;border:1px solid #ddd;border-radius:8px;font-size:12px;"></textarea>
-        <button id="btnApplyAnswer" type="button" style="padding:8px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;">Apply answer</button>
-      </div>
-
-      <div style="display:flex;gap:8px;">
-        <button id="btnReset" type="button" style="flex:1;padding:8px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;">Clear session (local)</button>
-      </div>
-
-      <div style="display:grid;gap:6px;">
-        <div style="font-size:12px;font-weight:600;">DataChannel</div>
-        <div id="dcState" style="font-size:12px;color:#555;">Not connected</div>
-        <textarea id="msgIn" placeholder="Type message…" style="width:100%;height:60px;resize:vertical;padding:8px;border:1px solid #ddd;border-radius:8px;font-size:12px;"></textarea>
-        <button id="btnSend" type="button" style="padding:8px 10px;border:1px solid #ddd;background:#fff;border-radius:8px;cursor:pointer;" disabled>Send</button>
-        <pre id="log" style="white-space:pre-wrap;margin:0;padding:10px;border:1px solid #eee;border-radius:8px;background:#fafafa;font-size:12px;max-height:160px;overflow:auto;"></pre>
-      </div>
+    <label class="pl-label" for="offerOut">Your offer (read-only — copy to send)</label>
+    <div class="pl-blob-row">
+      <textarea id="offerOut" class="pl-blob pl-blob--out" readonly spellcheck="false" autocomplete="off" placeholder="Click “Create offer” first…"></textarea>
+      <button type="button" class="pl-btn pl-btn--secondary" id="btnCopyOffer">Copy offer</button>
     </div>
+    <label class="pl-label" for="answerIn">Peer’s answer (paste here)</label>
+    <textarea id="answerIn" class="pl-blob pl-blob--in" spellcheck="false" autocomplete="off" placeholder="Paste the answer blob from your peer…" rows="4"></textarea>
+    <button type="button" class="pl-btn pl-btn--primary" id="btnApplyAnswer" style="width:100%;margin-top:4px;">2. Apply answer</button>
+  </div>
+
+  <div id="panelReceive" class="pl-panel-receive" hidden>
+    <label class="pl-label" for="offerIn">Peer’s offer (paste here)</label>
+    <textarea id="offerIn" class="pl-blob pl-blob--in" spellcheck="false" autocomplete="off" placeholder="Paste the offer blob from your peer…" rows="4"></textarea>
+    <div class="pl-row-actions">
+      <button type="button" class="pl-btn pl-btn--primary" id="btnAnswer">1. Create answer</button>
+    </div>
+    <label class="pl-label" for="answerOut">Your answer (read-only — copy to send)</label>
+    <div class="pl-blob-row">
+      <textarea id="answerOut" class="pl-blob pl-blob--out" readonly spellcheck="false" autocomplete="off" placeholder="Create answer first…"></textarea>
+      <button type="button" class="pl-btn pl-btn--secondary" id="btnCopyAnswer">Copy answer</button>
+    </div>
+  </div>
+</div>
+
+<details class="pl-card pl-ice">
+  <summary>ICE servers (technical)</summary>
+  <p class="pl-muted">From the open tab’s WebRTC. Credentials are secret — do not share this block.</p>
+  <div class="pl-row-actions">
+    <button type="button" class="pl-btn pl-btn--ghost" id="btnRefreshIce">Refresh from tab</button>
+  </div>
+  <pre id="iceSummary" style="margin:0 0 8px;padding:8px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;font-size:10px;max-height:88px;overflow:auto;white-space:pre-wrap;"></pre>
+  <pre id="iceJson" style="margin:0;padding:8px;border:1px solid #e2e8f0;border-radius:8px;background:#f1f5f9;font-size:9px;line-height:1.35;max-height:140px;overflow:auto;"></pre>
+</details>
+</div>
+
+<div class="pl-card pl-chat">
+  <label class="pl-label" id="pl-chat-heading">Chat</label>
+  <div id="dcState" style="font-size:12px;color:#475569;margin-bottom:8px;">Not connected</div>
+  <div id="pl-transcript" class="pl-transcript" aria-live="polite"></div>
+  <textarea id="msgIn" class="pl-blob pl-blob--in" placeholder="Type a message…" rows="2" style="min-height:52px;max-height:80px;"></textarea>
+  <div class="pl-footer-actions">
+    <button type="button" class="pl-btn pl-btn--primary" id="btnSend" disabled>Send</button>
+    <button type="button" class="pl-btn pl-btn--ghost" id="btnReset">Clear local peers</button>
+  </div>
+  <div id="pl-log-section">
+    <label class="pl-label" style="margin-top:12px;">Log</label>
+    <pre id="log" style="white-space:pre-wrap;margin:0;padding:10px;border:1px solid #e2e8f0;border-radius:8px;background:#f8fafc;font-size:11px;max-height:140px;overflow:auto;line-height:1.4;"></pre>
+  </div>
+</div>
   `;
 }
 
@@ -177,6 +288,25 @@ function setSendEnabled(enabled: boolean) {
   ($('#btnSend') as HTMLButtonElement).disabled = !enabled;
 }
 
+function appendChatLine(role: 'me' | 'peer', text: string) {
+  const tr = $('#pl-transcript') as HTMLDivElement | null;
+  if (!tr) return;
+  const row = document.createElement('div');
+  row.className = role === 'me' ? 'pl-tr--me' : 'pl-tr--peer';
+  row.textContent = text;
+  tr.appendChild(row);
+  tr.scrollTop = tr.scrollHeight;
+}
+
+/** When the DataChannel is open, hide handshake/ICE and focus on chat. */
+function setChatOnlyLayout(on: boolean) {
+  document.body.classList.toggle('pl-chat-only', on);
+  const h = $('#pl-chat-heading') as HTMLLabelElement | null;
+  if (h) h.textContent = on ? 'Connected' : 'Chat';
+  const tr = $('#pl-transcript') as HTMLDivElement | null;
+  if (tr && on) tr.replaceChildren();
+}
+
 function closeLocalPeers() {
   try {
     dcA?.close();
@@ -204,21 +334,27 @@ function closeLocalPeers() {
   pcB = null;
   setDcState('Not connected');
   setSendEnabled(false);
+  setChatOnlyLayout(false);
+  ($('#pl-transcript') as HTMLDivElement | null)?.replaceChildren();
 }
 
 function attachDc(dc: RTCDataChannel, label: string) {
   dc.addEventListener('open', () => {
     setDcState(`Connected (${label})`);
     setSendEnabled(true);
+    setChatOnlyLayout(true);
     void persistLogLine(`[dc] open (${label})`);
   });
   dc.addEventListener('close', () => {
     setDcState('Closed');
     setSendEnabled(false);
+    setChatOnlyLayout(false);
     void persistLogLine(`[dc] close (${label})`);
   });
   dc.addEventListener('message', e => {
-    void persistLogLine(`[peer] ${String(e.data)}`);
+    const s = String(e.data);
+    void persistLogLine(`[peer] ${s}`);
+    appendChatLine('peer', s);
   });
   dc.addEventListener('error', () => {
     void persistLogLine(`[dc] error (${label})`);
@@ -307,6 +443,7 @@ function applyUiFromState(r: Extract<BgStateResponse, { ok: true }>, opts?: { fu
   }
 
   updateIcePanel(r.state);
+  setUiMode(ui.uiRole === 'receive' ? 'receive' : 'offer');
 }
 
 function wireUiPersistence(tabId: number) {
@@ -314,13 +451,9 @@ function wireUiPersistence(tabId: number) {
     void mergePeerLinkUi(tabId, patch);
   }, 300);
 
-  for (const id of ['offerOut', 'offerIn', 'answerOut', 'answerIn'] as const) {
+  for (const id of ['offerIn', 'answerIn'] as const) {
     const el = $(`#${id}`) as HTMLTextAreaElement;
-    el.addEventListener('input', () => {
-      // Avoid debounced empty saves wiping a just-created offer blob from storage.
-      if ((id === 'offerOut' || id === 'answerOut') && el.value.trim() === '') return;
-      save({ [id]: el.value });
-    });
+    el.addEventListener('input', () => save({ [id]: el.value }));
   }
 }
 
@@ -404,6 +537,18 @@ async function main() {
   applyUiFromState(r, { fullLog: true });
   wireUiPersistence(tabId);
   bindHandshakeFlushOnClose(tabId);
+
+  ($('#modeOffer') as HTMLButtonElement).addEventListener('click', () => setUiMode('offer', tabId));
+  ($('#modeRecv') as HTMLButtonElement).addEventListener('click', () => setUiMode('receive', tabId));
+
+  ($('#btnCopyOffer') as HTMLButtonElement).addEventListener('click', async () => {
+    const ok = await copyToClipboard(($('#offerOut') as HTMLTextAreaElement).value);
+    flashButtonLabel($('#btnCopyOffer') as HTMLButtonElement, ok);
+  });
+  ($('#btnCopyAnswer') as HTMLButtonElement).addEventListener('click', async () => {
+    const ok = await copyToClipboard(($('#answerOut') as HTMLTextAreaElement).value);
+    flashButtonLabel($('#btnCopyAnswer') as HTMLButtonElement, ok);
+  });
 
   ($('#btnRefreshIce') as HTMLButtonElement).addEventListener('click', async () => {
     try {
@@ -537,7 +682,9 @@ async function main() {
     }
     try {
       dc.send(text);
+      appendChatLine('me', text);
       await persistLogLine(`[me] ${text}`);
+      ($('#msgIn') as HTMLTextAreaElement).value = '';
     } catch (e) {
       await persistLogLine(`[error] ${e instanceof Error ? e.message : String(e)}`);
     }
