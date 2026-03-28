@@ -140,7 +140,7 @@ function render() {
     <button type="button" class="pl-seg__btn pl-seg__btn--active" id="modeOffer" role="tab" aria-selected="true" aria-pressed="true">Start — I send offer</button>
     <button type="button" class="pl-seg__btn" id="modeRecv" role="tab" aria-selected="false" aria-pressed="false">Join — I send answer</button>
   </div>
-  <p class="pl-hint">The offer side runs WebRTC in a hidden background page so you can close the popup after copying the offer and reopen it to paste the answer without regenerating the offer. Handshake text is saved per tab. Each blob waits until ICE gathering finishes so STUN/TURN candidates are inside the SDP — offer and answer are enough; no separate ICE trickle step.</p>
+  <p class="pl-hint">The offer side runs WebRTC in a hidden background page so you can close the popup after copying the offer and reopen it to paste the answer without regenerating the offer. Handshake text is saved per tab. Each blob waits until ICE gathering finishes so STUN/TURN candidates are inside the SDP — offer and answer are enough; no separate ICE trickle step. For different networks, public STUN is always merged with servers captured from the tab; if the log shows relay=0 on both sides and it still fails, open a call on that site so its TURN credentials are captured.</p>
 
   <div id="panelOffer" class="pl-panel-offer">
     <div class="pl-row-actions">
