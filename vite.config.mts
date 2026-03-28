@@ -1,8 +1,9 @@
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import makeManifestPlugin from './utils/plugins/make-manifest-plugin.js';
 
-const rootDir = resolve(new URL('.', import.meta.url).pathname);
+const rootDir = fileURLToPath(new URL('.', import.meta.url));
 const srcDir = resolve(rootDir, 'src');
 
 const outDir = resolve(rootDir, 'dist');
