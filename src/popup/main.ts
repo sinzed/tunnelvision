@@ -396,7 +396,7 @@ function offererStillNeedsAnswer(pc: RTCPeerConnection | null): boolean {
   return pc.localDescription?.type === 'offer';
 }
 
-/** Peer A loses in-memory pcA when the popup closes; rebuild from the saved offer blob before setRemoteDescription(answer). */
+/** Peer A loses in-memory pcA when the popup closes; rebuild with the saved offer SDP (not a new offer) so the pasted answer still matches. */
 async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
   if (offerCreationInFlight) {
     await offerCreationInFlight;
@@ -428,6 +428,9 @@ async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
   if (prevBundle.sdp.type && prevBundle.sdp.type !== 'offer') {
     throw new Error('Saved blob is not an offer. Copy a fresh offer from “Create offer”.');
   }
+  if (!prevBundle.sdp.sdp?.trim()) {
+    throw new Error('Saved offer has no SDP. Click “Create offer” again.');
+  }
 
   closeLocalPeers();
   await persistLogLine('[offer] rebuilt local peer (in-memory connection was gone — e.g. popup closed or “Create answer” cleared it)');
@@ -446,22 +449,15 @@ async function ensureOffererReadyForAnswer(tabId: number): Promise<void> {
   dcA = pcA.createDataChannel('bale-link');
   attachDc(dcA, 'A');
 
-  // Chrome requires setLocalDescription to use the SDP from createOffer() on this same RTCPeerConnection;
-  // re-applying a serialized offer from an old PC throws “SDP does not match the previously generated SDP”.
-  const fresh = await pcA.createOffer();
-  await pcA.setLocalDescription(fresh);
+  // Rehydrate the exact offer your peer answered (same ICE/DTLS as the blob). Do not call createOffer()
+  // first — that generates a new SDP and would invalidate the pasted answer.
+  const restored: RTCSessionDescriptionInit = {
+    type: 'offer',
+    sdp: prevBundle.sdp.sdp,
+  };
+  await pcA.setLocalDescription(restored);
   await waitForIceGathering(pcA, log, { waitUntilComplete: true });
-
-  const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
-  const offerB64 = b64encodeUtf8(JSON.stringify(bundle));
-  ($('#offerOut') as HTMLTextAreaElement).value = offerB64;
-  await mergePeerLinkUi(tabId, { offerOut: offerB64 });
-  await persistLogLine(
-    '[offer] a new offer was generated (fingerprints/ICE differ from the saved blob). Share it with your peer, get a new answer, then click “Apply answer” again.',
-  );
-  throw new Error(
-    'Local peer was recreated, so the old answer no longer matches. Copy the updated offer to your peer, paste the new answer, and click “Apply answer” again.',
-  );
+  await persistLogLine('[offer] restored local peer from saved offer blob (pairs with existing answer)');
 }
 
 function applyUiFromState(r: Extract<BgStateResponse, { ok: true }>, opts?: { fullLog?: boolean }) {
