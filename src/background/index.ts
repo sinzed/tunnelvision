@@ -1,3 +1,5 @@
+import { loadPeerLinkUi, mergePeerLinkUi, peerLinkUiKey, type PeerLinkStoredUi } from '../lib/peer-link-ui-storage';
+
 type TabCaptureState = {
   url?: string;
   iceServers?: RTCIceServer[];
@@ -7,16 +9,7 @@ type TabCaptureState = {
   lastError?: string;
 };
 
-type StoredUi = {
-  offerOut?: string;
-  offerIn?: string;
-  answerOut?: string;
-  answerIn?: string;
-  logs?: string[];
-};
-
 const iceKey = (tabId: number) => `peerLink_ice_${tabId}`;
-const uiKey = (tabId: number) => `peerLink_ui_${tabId}`;
 
 const tabState = new Map<number, TabCaptureState>();
 const portsByTab = new Map<number, Set<chrome.runtime.Port>>();
@@ -34,25 +27,11 @@ async function loadStoredIce(tabId: number): Promise<TabCaptureState | null> {
   return v && typeof v === 'object' ? v : null;
 }
 
-async function loadStoredUi(tabId: number): Promise<StoredUi> {
-  const r = await chrome.storage.local.get(uiKey(tabId));
-  const v = r[uiKey(tabId)] as StoredUi | undefined;
-  return v && typeof v === 'object' ? v : {};
-}
-
-async function patchStoredUi(tabId: number, patch: Partial<StoredUi>) {
-  const cur = await loadStoredUi(tabId);
-  const next: StoredUi = { ...cur, ...patch };
-  if (next.logs && next.logs.length > 120) next.logs = next.logs.slice(-120);
-  await chrome.storage.local.set({ [uiKey(tabId)]: next });
-  return next;
-}
-
 function appendLog(tabId: number, line: string) {
   void (async () => {
-    const cur = await loadStoredUi(tabId);
+    const cur = await loadPeerLinkUi(tabId);
     const logs = [...(cur.logs ?? []), line].slice(-120);
-    await patchStoredUi(tabId, { logs });
+    await mergePeerLinkUi(tabId, { logs });
     for (const p of portsByTab.get(tabId) ?? []) {
       try {
         p.postMessage({ type: 'log', line });
@@ -63,8 +42,8 @@ function appendLog(tabId: number, line: string) {
   })();
 }
 
-function broadcastUi(tabId: number, patch: Partial<StoredUi>) {
-  void patchStoredUi(tabId, patch).then(() => {
+function broadcastUi(tabId: number, patch: Partial<PeerLinkStoredUi>) {
+  void mergePeerLinkUi(tabId, patch).then(() => {
     for (const p of portsByTab.get(tabId) ?? []) {
       try {
         p.postMessage({ type: 'ui', patch });
@@ -86,7 +65,7 @@ function subscribePort(tabId: number, port: chrome.runtime.Port) {
     bucket!.delete(port);
     if (bucket!.size === 0) portsByTab.delete(tabId);
   });
-  void loadStoredUi(tabId).then(ui => {
+  void loadPeerLinkUi(tabId).then(ui => {
     try {
       port.postMessage({ type: 'init', ui, tabId });
     } catch {
@@ -107,7 +86,7 @@ async function mergeStateForTab(tabId: number): Promise<TabCaptureState> {
 
 chrome.tabs.onRemoved.addListener(tabId => {
   tabState.delete(tabId);
-  void chrome.storage.local.remove([iceKey(tabId), uiKey(tabId)]);
+  void chrome.storage.local.remove([iceKey(tabId), peerLinkUiKey(tabId)]);
 });
 
 chrome.runtime.onConnect.addListener(port => {
@@ -164,7 +143,7 @@ chrome.runtime.onMessage.addListener((msg: any, sender: chrome.runtime.MessageSe
 
   if (msg?.type === 'BALE_UI_SAVE') {
     const tabId = msg.tabId as number;
-    if (typeof tabId === 'number') void patchStoredUi(tabId, msg.patch ?? {});
+    if (typeof tabId === 'number') void mergePeerLinkUi(tabId, msg.patch ?? {});
     return;
   }
 
@@ -184,7 +163,7 @@ chrome.runtime.onMessage.addListener((msg: any, sender: chrome.runtime.MessageSe
           return;
         }
         const state = await mergeStateForTab(tabId);
-        const ui = await loadStoredUi(tabId);
+        const ui = await loadPeerLinkUi(tabId);
         sendResponse({ ok: true, tabId, state, ui });
       })
       .catch((err: unknown) => sendResponse({ ok: false, reason: err instanceof Error ? err.message : String(err) }));

@@ -1,4 +1,5 @@
 import { countCandidatesInSdp, waitForIceGathering } from '../lib/ice-gather';
+import { mergePeerLinkUi } from '../lib/peer-link-ui-storage';
 
 type BgStateResponse =
   | {
@@ -44,7 +45,7 @@ function render() {
         <pre id="iceJson" style="margin:0;padding:8px;border:1px solid #ddd;border-radius:8px;background:#fafafa;font-size:10px;line-height:1.35;max-height:180px;overflow:auto;"></pre>
       </div>
 
-      <div style="font-size:11px;color:#666;">WebRTC runs in this popup. Keep it open while connected; ICE above stays saved per tab.</div>
+      <div style="font-size:11px;color:#666;">WebRTC runs in this popup while connected. Offer/answer blobs are saved to storage when the popup closes so you can paste Peer B’s answer after reopening.</div>
 
       <div style="display:grid;gap:6px;">
         <div style="font-size:12px;font-weight:600;">1) Create offer (Peer A)</div>
@@ -310,8 +311,8 @@ function applyUiFromState(r: Extract<BgStateResponse, { ok: true }>, opts?: { fu
 
 function wireUiPersistence(tabId: number) {
   const save = debounce((patch: Record<string, string>) => {
-    void chrome.runtime.sendMessage({ type: 'BALE_UI_SAVE', tabId, patch });
-  }, 400);
+    void mergePeerLinkUi(tabId, patch);
+  }, 300);
 
   for (const id of ['offerOut', 'offerIn', 'answerOut', 'answerIn'] as const) {
     const el = $(`#${id}`) as HTMLTextAreaElement;
@@ -321,6 +322,22 @@ function wireUiPersistence(tabId: number) {
       save({ [id]: el.value });
     });
   }
+}
+
+/** Writes handshake fields straight to chrome.storage from the popup so they survive an immediate close. */
+function bindHandshakeFlushOnClose(tabId: number) {
+  const flush = () => {
+    void mergePeerLinkUi(tabId, {
+      offerOut: ($('#offerOut') as HTMLTextAreaElement).value,
+      offerIn: ($('#offerIn') as HTMLTextAreaElement).value,
+      answerOut: ($('#answerOut') as HTMLTextAreaElement).value,
+      answerIn: ($('#answerIn') as HTMLTextAreaElement).value,
+    });
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flush();
+  });
+  window.addEventListener('pagehide', flush);
 }
 
 async function main() {
@@ -386,6 +403,7 @@ async function main() {
 
   applyUiFromState(r, { fullLog: true });
   wireUiPersistence(tabId);
+  bindHandshakeFlushOnClose(tabId);
 
   ($('#btnRefreshIce') as HTMLButtonElement).addEventListener('click', async () => {
     try {
@@ -441,7 +459,7 @@ async function main() {
       const bundle: HandshakeBundle = { sdp: pcA.localDescription! };
       const offerB64 = b64encodeUtf8(JSON.stringify(bundle));
       ($('#offerOut') as HTMLTextAreaElement).value = offerB64;
-      await chrome.runtime.sendMessage({ type: 'BALE_UI_SAVE', tabId, patch: { offerOut: offerB64 } });
+      await mergePeerLinkUi(tabId, { offerOut: offerB64 });
       await persistLogLine(`[offer] done (candidates in SDP: ${countCandidatesInSdp(pcA.localDescription?.sdp)})`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -487,11 +505,7 @@ async function main() {
       const bundle: HandshakeBundle = { sdp: pc.localDescription! };
       const answerB64 = b64encodeUtf8(JSON.stringify(bundle));
       ($('#answerOut') as HTMLTextAreaElement).value = answerB64;
-      await chrome.runtime.sendMessage({
-        type: 'BALE_UI_SAVE',
-        tabId,
-        patch: { offerIn: offerText, answerOut: answerB64 },
-      });
+      await mergePeerLinkUi(tabId, { offerIn: offerText, answerOut: answerB64 });
       await persistLogLine(`[answer] done (candidates in SDP: ${countCandidatesInSdp(pc.localDescription?.sdp)})`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -507,7 +521,7 @@ async function main() {
       await ensureOffererReadyForAnswer(tabId);
       const answerBundle = decodeBundle(answerText);
       await pcA!.setRemoteDescription(answerBundle.sdp);
-      await chrome.runtime.sendMessage({ type: 'BALE_UI_SAVE', tabId, patch: { answerIn: answerText } });
+      await mergePeerLinkUi(tabId, { answerIn: answerText });
       await persistLogLine('[answer] applied');
     } catch (e) {
       await persistLogLine(`[error] ${e instanceof Error ? e.message : String(e)}`);
