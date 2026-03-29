@@ -140,7 +140,7 @@ function render() {
     <button type="button" class="pl-seg__btn pl-seg__btn--active" id="modeOffer" role="tab" aria-selected="true" aria-pressed="true">Start — I send offer</button>
     <button type="button" class="pl-seg__btn" id="modeRecv" role="tab" aria-selected="false" aria-pressed="false">Join — I send answer</button>
   </div>
-  <p class="pl-hint">The offer side runs WebRTC in a hidden background page so you can close the popup after copying the offer and reopen it to paste the answer without regenerating the offer. Handshake text is saved per tab. Each blob waits until ICE gathering finishes so STUN/TURN candidates are inside the SDP — offer and answer are enough; no separate ICE trickle step. For different networks, public STUN is always merged with servers captured from the tab; if the log shows relay=0 on both sides and it still fails, open a call on that site so its TURN credentials are captured.</p>
+  <p class="pl-hint">The offer side runs WebRTC in a hidden background page so you can close the popup after copying the offer and reopen it to paste the answer without regenerating the offer. Handshake text is saved per tab. Wait until the log shows “gathering complete” before copying offer or answer — copying too early produces incomplete ICE and the link can hang in “connecting”. For different networks, public STUN is merged with servers captured from the tab; if relay=0 on both sides and it still fails, open a call on that site so TURN credentials are captured.</p>
 
   <div id="panelOffer" class="pl-panel-offer">
     <div class="pl-row-actions">
@@ -581,6 +581,7 @@ async function main() {
   });
 
   ($('#btnAnswer') as HTMLButtonElement).addEventListener('click', async () => {
+    let pc: RTCPeerConnection | undefined;
     try {
       const st = await getState();
       if (!st.ok) throw new Error(st.reason);
@@ -592,13 +593,21 @@ async function main() {
       await persistLogLine('[answer] creating…');
 
       const offerBundle = decodeBundle(offerText);
-      const pc = new RTCPeerConnection({ iceServers });
+      pc = new RTCPeerConnection({ iceServers });
       const log = (line: string) => {
         appendLogLine(line);
         void chrome.runtime.sendMessage({ type: 'BALE_APPEND_LOG', tabId, line }).catch(() => void 0);
       };
-      pc.addEventListener('connectionstatechange', () => log(`[pcB] ${pc.connectionState}`));
-      pc.addEventListener('iceconnectionstatechange', () => log(`[pcB] ice=${pc.iceConnectionState}`));
+      pc.addEventListener('connectionstatechange', () => log(`[pcB] conn=${pc.connectionState}`));
+      pc.addEventListener('iceconnectionstatechange', () => {
+        log(`[pcB] ice=${pc.iceConnectionState}`);
+        if (pc.iceConnectionState === 'failed') {
+          log(
+            '[pcB] ICE failed — copy offer/answer only after “gathering complete”; across NAT both sides need srflx or TURN relay.',
+          );
+        }
+      });
+      pc.addEventListener('signalingstatechange', () => log(`[pcB] signaling=${pc.signalingState}`));
       pc.addEventListener('icecandidateerror', e => {
         log(`[pcB] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
       });
@@ -625,6 +634,11 @@ async function main() {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       await persistLogLine(`[error] ${msg}`);
+      try {
+        pc?.close();
+      } catch {
+        /* ignore */
+      }
       closePeerBOnly();
     }
   });

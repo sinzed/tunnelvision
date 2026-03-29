@@ -23,6 +23,7 @@ function offererStillNeedsAnswer(pc: RTCPeerConnection): boolean {
 }
 
 function closeSession(tabId: number) {
+  logChains.delete(tabId);
   const s = sessions.get(tabId);
   if (!s) return;
   try {
@@ -47,8 +48,15 @@ function forwardDcState(tabId: number, state: string, label: string) {
   });
 }
 
-function forwardLog(tabId: number, line: string) {
-  chrome.runtime.sendMessage({ type: 'PL_HOST_LOG', tabId, line });
+/** Serialize logs so order matches real-time (parallel sendMessage can reorder lines in the UI). */
+const logChains = new Map<number, Promise<void>>();
+
+function forwardLog(tabId: number, line: string): void {
+  const prev = logChains.get(tabId) ?? Promise.resolve();
+  const next = prev.then(() =>
+    chrome.runtime.sendMessage({ type: 'PL_HOST_LOG', tabId, line }).then(() => void 0),
+  );
+  logChains.set(tabId, next.catch(() => void 0));
 }
 
 function attachDc(tabId: number, dc: RTCDataChannel, label: string) {
@@ -78,8 +86,16 @@ async function handleCreateOffer(tabId: number, iceServers: RTCIceServer[]) {
 
   const pc = new RTCPeerConnection({ iceServers });
   const log = (line: string) => forwardLog(tabId, line);
-  pc.addEventListener('connectionstatechange', () => log(`[pcA] ${pc.connectionState}`));
-  pc.addEventListener('iceconnectionstatechange', () => log(`[pcA] ice=${pc.iceConnectionState}`));
+  pc.addEventListener('connectionstatechange', () => log(`[pcA] conn=${pc.connectionState}`));
+  pc.addEventListener('iceconnectionstatechange', () => {
+    log(`[pcA] ice=${pc.iceConnectionState}`);
+    if (pc.iceConnectionState === 'failed') {
+      log(
+        '[pcA] ICE failed — check both blobs were copied after “gathering complete”, both sides have STUN/TURN, and try TURN from an active call on the capture tab.',
+      );
+    }
+  });
+  pc.addEventListener('signalingstatechange', () => log(`[pcA] signaling=${pc.signalingState}`));
   pc.addEventListener('icecandidateerror', e => {
     log(`[pcA] icecandidateerror code=${e.errorCode} text=${e.errorText ?? ''}`);
   });
@@ -87,9 +103,23 @@ async function handleCreateOffer(tabId: number, iceServers: RTCIceServer[]) {
   const dc = pc.createDataChannel('bale-link');
   attachDc(tabId, dc, 'A');
 
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  await waitForIceGathering(pc, log, { waitUntilComplete: true });
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIceGathering(pc, log, { waitUntilComplete: true });
+  } catch (e) {
+    try {
+      dc.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      pc.close();
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
 
   const bundle: HandshakeBundle = { sdp: pc.localDescription! };
   const offerB64 = encodeBundle(bundle);
@@ -119,7 +149,10 @@ async function handleApplyAnswer(tabId: number, answerText: string) {
 
   const answerBundle = decodeBundle(answerText);
   await s.pc.setRemoteDescription(answerBundle.sdp);
-  forwardLog(tabId, '[answer] applied');
+  forwardLog(
+    tabId,
+    `[answer] applied (signaling=${s.pc.signalingState}, ice=${s.pc.iceConnectionState}, conn=${s.pc.connectionState})`,
+  );
   return { ok: true as const };
 }
 
