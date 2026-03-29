@@ -90,7 +90,7 @@ async function ensureOffscreenDocument(): Promise<void> {
       if (!/Only a single offscreen|already exists|duplicate/i.test(msg)) throw e;
     }
   }
-  await waitForOffscreenPort(8000);
+  await waitForOffscreenPort(30_000);
 }
 
 async function sendOffscreenRpc(payload: Record<string, unknown>): Promise<Record<string, unknown>> {

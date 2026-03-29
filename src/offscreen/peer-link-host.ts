@@ -189,31 +189,51 @@ async function handleMessage(msg: HostRequest): Promise<Record<string, unknown>>
   }
 }
 
-const port = chrome.runtime.connect({ name: 'peer-link-offscreen' });
-
-port.onMessage.addListener((msg: { _replyId?: string } & Partial<HostRequest>) => {
-  if (!msg.type?.startsWith('PL_HOST_')) return;
-
-  if (!msg._replyId) {
-    if (msg.type === 'PL_HOST_CLOSE' && typeof msg.tabId === 'number') {
-      closeSession(msg.tabId);
-      forwardDcState(msg.tabId, 'closed', 'A');
-    }
+/**
+ * MV3 service workers suspend; the Port dies while this document (and RTCPeerConnections) can stay alive.
+ * Reconnect so the background can reach us again for “Apply answer” / chat.
+ */
+function wireHostPort(): void {
+  let p: chrome.runtime.Port;
+  try {
+    p = chrome.runtime.connect({ name: 'peer-link-offscreen' });
+  } catch {
+    setTimeout(wireHostPort, 400);
     return;
   }
 
-  const rid = msg._replyId;
-  const { _replyId: _r, ...rest } = msg;
-  void (async () => {
-    try {
-      const result = await handleMessage(rest as HostRequest);
-      port.postMessage({ _replyId: rid, ...result });
-    } catch (e) {
-      port.postMessage({
-        _replyId: rid,
-        ok: false,
-        error: e instanceof Error ? e.message : String(e),
-      });
+  const onMsg = (msg: { _replyId?: string } & Partial<HostRequest>) => {
+    if (!msg.type?.startsWith('PL_HOST_')) return;
+
+    if (!msg._replyId) {
+      if (msg.type === 'PL_HOST_CLOSE' && typeof msg.tabId === 'number') {
+        closeSession(msg.tabId);
+        forwardDcState(msg.tabId, 'closed', 'A');
+      }
+      return;
     }
-  })();
-});
+
+    const rid = msg._replyId;
+    const { _replyId: _r, ...rest } = msg;
+    void (async () => {
+      try {
+        const result = await handleMessage(rest as HostRequest);
+        p.postMessage({ _replyId: rid, ...result });
+      } catch (e) {
+        p.postMessage({
+          _replyId: rid,
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })();
+  };
+
+  p.onMessage.addListener(onMsg);
+  p.onDisconnect.addListener(() => {
+    p.onMessage.removeListener(onMsg);
+    setTimeout(wireHostPort, 50);
+  });
+}
+
+wireHostPort();
